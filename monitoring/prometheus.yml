@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files: []
+
+scrape_configs:
+  - job_name: "borsabot_data_ingestion"
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+
+  - job_name: "borsabot_execution_engine"
+    static_configs:
+      - targets: ["host.docker.internal:8002"]
+
+  - job_name: "borsabot_risk_engine"
+    static_configs:
+      - targets: ["host.docker.internal:8003"]
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "borsabot_live_trader"
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+    metrics_path: /metrics
+    scrape_interval: 5s

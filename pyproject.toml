@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "borsabot"
+version = "0.1.0"
+description = "AI-Native, Execution-Aware, Event-Driven Algorithmic Trading Platform"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Async & messaging
+    "pyzmq>=25.1",
+    "redis[hiredis]>=5.0",
+    "asyncpg>=0.29",
+
+    # Broker adapters
+    "python-binance>=1.0.19",
+    "websockets>=12.0",
+    "ib-insync>=0.9.86",
+    "MetaTrader5>=5.0",
+
+    # Data / storage
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=15.0",
+    "msgpack>=1.0",
+
+    # Feature engineering & ML
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "lightgbm>=4.3",
+    "hmmlearn>=0.3",
+    "imbalanced-learn>=0.11",
+    "sortedcontainers>=2.4",
+    "statsmodels>=0.14",
+
+    # Config & observability
+    "pydantic-settings>=2.2",
+    "structlog>=24.1",
+    "prometheus-client>=0.20",
+    "python-dotenv>=1.0",
+
+    # Execution state machine
+    "transitions>=0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.2",
+    "hypothesis>=6.100",
+    "httpx>=0.27",
+    "freezegun>=1.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths  = ["tests"]
+timeout    = 30
+markers    = [
+    "slow: marks tests as slow (deselect with '-m not slow')",
+    "integration: marks tests requiring external services",
+]
+
+[tool.pytest-asyncio]
+mode = "auto"
+
+[tool.coverage.run]
+source = ["borsabot"]
+omit   = ["tests/*", "scripts/*"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["borsabot*"]
