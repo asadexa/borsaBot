@@ -191,8 +191,11 @@ async def main(
     from borsabot.execution.order_fsm import OrderManager
 
     execution = ExecutionEngine(
-        broker=broker, 
-        default_twap_slices=1  # 0.01 altı geçersiz lot sorunu (10014) için eklendi
+        broker=broker,
+        max_slippage_bps=100.0,  # Forex spread toleransi -- dar tutulursa bloke eder
+        min_fill_prob=0.1,       # Fill prob filtresi cok katı olmasin
+        default_twap_slices=1,   # 1 = aninda market order, bolme yok
+        default_twap_duration=1, # 1 sn -- esasen anlik
     )
 
     # ── Per-symbol tick history buffers (rolling 500 ticks) ───────────────
@@ -201,11 +204,12 @@ async def main(
 
     # ── State and Cooldown Management ─────────────────────────────────────
     user_settings = user_settings or {}
-    RR_RATIO = user_settings.get("RISK_REWARD_RATIO", 2.0)
-    SL_ATR_MULT = user_settings.get("SL_ATR_MULTIPLIER", 1.5)
-    CONF_MIN = user_settings.get("CONFIDENCE_THRESHOLD", 0.60)
-    ADX_MIN = user_settings.get("ADX_MINIMUM", 20.0)
-    COOLDOWN_SEC = user_settings.get("COOLDOWN_HOURS", 6.0) * 3600
+    RR_RATIO     = user_settings.get("RISK_REWARD_RATIO",    2.0)
+    SL_ATR_MULT  = user_settings.get("SL_ATR_MULTIPLIER",   1.5)
+    CONF_MIN     = user_settings.get("CONFIDENCE_THRESHOLD", 0.60)
+    ADX_MIN      = user_settings.get("ADX_MINIMUM",          20.0)
+    COOLDOWN_SEC = user_settings.get("COOLDOWN_HOURS",        6.0) * 3600
+    META_CONF_MIN = user_settings.get("META_CONF_MIN",        0.55)  # 0.0 = meta filter tamamen bypass
 
     last_eval_time: dict[str, float] = {s: 0.0 for s in symbols}
     last_signal_state: dict[str, int] = {s: 0 for s in symbols} # 0=FLAT, 1=BUY, -1=SELL
@@ -371,13 +375,20 @@ async def main(
 
         if side_int == 0:
             last_signal_state[sym] = 0 # reset state when flat
+            log.info("[%s] PRIMARY: FLAT sinyal -- atlanıyor", sym)
             return
 
-        # ── Relaxed A/B Test (Demo Data Collection) ───────────────────────
+        log.info("[%s] PRIMARY sinyal: side=%s conf=%.3f (esik=%.2f) adx=%.1f (esik=%.1f)",
+                 sym, side_int, confidence, CONF_MIN,
+                 float(features_dict.get("adx_14", 0.0)), ADX_MIN)
+
+        # ── Filtre kontrolleri ────────────────────────────────────────────
         adx = float(features_dict.get("adx_14", 0.0))
         if confidence < CONF_MIN:
+            log.info("[%s] BLOKE: Guven dusuk %.3f < %.2f", sym, confidence, CONF_MIN)
             return
         if adx != 0.0 and adx < ADX_MIN:
+            log.info("[%s] BLOKE: ADX dusuk %.1f < %.1f", sym, adx, ADX_MIN)
             return
             
         # ── Dynamic SL/TP Calculation (Rule set logic) ────────────────────
@@ -410,24 +421,31 @@ async def main(
         except Exception as exc:
             log.error("CSV Log failed: %s", exc)
 
-        # ── State Machine & Cooldown Prevention ───────────────────────────
-        if side_int == last_signal_state[sym]:
-            # Same directional signal already active/triggered previously
-            return
-            
-        if current_time - last_trade_time[sym] < COOLDOWN_SEC:
-            log.info("Trade blocked for %s due to %.1fh cooldown.", sym, COOLDOWN_SEC / 3600.0)
+        # ── Cooldown Prevention ───────────────────────────────────────────
+        elapsed = current_time - last_trade_time[sym]
+        if elapsed < COOLDOWN_SEC:
+            log.info("[%s] BLOKE: Cooldown aktif, kalan %.0fs (%.1fh ayar)",
+                     sym, COOLDOWN_SEC - elapsed, COOLDOWN_SEC / 3600.0)
             return
 
+        # ── Acik pozisyon kontrolu ────────────────────────────────────────
         try:
             open_positions = await broker.get_positions()
-            if open_positions.get(sym, 0.0) != 0.0:
-                log.info("Trade blocked for %s: Open position exists.", sym)
+            pos_size = open_positions.get(sym, 0.0)
+            if pos_size != 0.0:
+                log.info("[%s] BLOKE: Acik pozisyon var (%.4f lot)", sym, pos_size)
                 return
+            else:
+                last_signal_state[sym] = 0  # pozisyon yok, state sifirla
         except Exception as e:
-            log.warning("Failed to verify open positions: %s", e)
+            log.warning("[%s] Pozisyon sorgusu basarisiz: %s -- devam ediliyor", sym, e)
 
-        # Valid trade transition!
+        # ── Ayni sinyal tekrar engeli ─────────────────────────────────────
+        if last_signal_state[sym] != 0 and side_int == last_signal_state[sym]:
+            log.info("[%s] BLOKE: Ayni yon sinyal zaten aktif (%s)", sym, side_int)
+            return
+
+        log.info("[%s] TUM FILTRELER GECILDI -- ISLEM BASLATILIYOR side=%s", sym, side_int)
         last_signal_state[sym] = side_int
         last_trade_time[sym] = current_time
 
@@ -448,18 +466,21 @@ async def main(
                     proba = m_obj.predict_proba(X_arr)[0]
                     
                     meta_conf = float(proba[1]) if len(proba) >= 2 else float(proba.max())
-                    should = meta_conf >= 0.55
+                    should = META_CONF_MIN == 0.0 or meta_conf >= META_CONF_MIN
                 else:
                     should, meta_conf = meta_model.should_trade(
                         features_series.to_frame().T, side_int, confidence
                     )
-                    
+                    if META_CONF_MIN == 0.0:
+                        should = True  # bypass
+
                 if not should:
-                    log.debug("MetaModel FILTERED signal: conf=%.3f", meta_conf)
+                    log.info("[%s] MetaModel FILTERED signal: meta_conf=%.3f < %.2f", sym, meta_conf, META_CONF_MIN)
                     return
+                log.info("[%s] MetaModel PASSED: meta_conf=%.3f", sym, meta_conf)
             except Exception as exc:
-                log.warning("MetaModel predict failed: %s", exc)
-                return
+                log.warning("MetaModel predict failed: %s — sinyal geciliyor", exc)
+                # Test modunda meta model hata verirse engelleme
 
         # ── Position sizing ───────────────────────────────────────────────
         mid   = book.mid_price()
@@ -479,10 +500,12 @@ async def main(
             qty = round(qty, 5)
 
         # ── Risk check ────────────────────────────────────────────────────
+        log.info("[%s] Lot: %.4f | order_usd: %.2f | mid: %.5f", sym, qty, order_usd, mid)
         ok, reason = risk.check_new_order(sym, order_usd)
         if not ok:
-            log.warning("Risk BLOCKED: %s", reason)
+            log.warning("[%s] BLOKE: Risk limiti -- %s", sym, reason)
             return
+        log.info("[%s] Risk kontrolu GECTI", sym)
 
         # ── Submit to execution engine ────────────────────────────────────
         from borsabot.core.events import Signal, OrderSide
@@ -689,51 +712,104 @@ if __name__ == "__main__":
         f"+------------------------------------------------------+"
     )
 
-    def run_interactive_wizard():
-        print("="*50)
-        print(" *** BORSABOT - TRADE RULESET (INTERACTIVE SETUP) ***")
-        print("="*50)
-        
-        settings = {
-            "RISK_REWARD_RATIO": 2.0,
-            "SL_ATR_MULTIPLIER": 1.5,
-            "CONFIDENCE_THRESHOLD": 0.60,
-            "ADX_MINIMUM": 20.0,
-            "COOLDOWN_HOURS": 6.0
-        }
-        
-        print("\n[Current Ruleset Defaults]")
-        for k, v in settings.items():
-            print(f"  {k} = {v}")
-            
-        print("\nPress [ENTER] to start bot with these rules, or type 'edit' to change them:")
-        try:
-            choice = input("> ").strip().lower()
-            if choice == 'edit':
-                print("\nEnter new values (leave blank to keep current):")
-                
-                val = input(f"Risk/Reward Ratio [{settings['RISK_REWARD_RATIO']}]: ").strip()
-                if val: settings['RISK_REWARD_RATIO'] = float(val)
-                
-                val = input(f"SL ATR Multiplier [{settings['SL_ATR_MULTIPLIER']}]: ").strip()
-                if val: settings['SL_ATR_MULTIPLIER'] = float(val)
-                
-                val = input(f"Confidence Threshold [{settings['CONFIDENCE_THRESHOLD']}]: ").strip()
-                if val: settings['CONFIDENCE_THRESHOLD'] = float(val)
-                
-                val = input(f"ADX Minimum [{settings['ADX_MINIMUM']}]: ").strip()
-                if val: settings['ADX_MINIMUM'] = float(val)
-                
-                val = input(f"Cooldown Hours [{settings['COOLDOWN_HOURS']}]: ").strip()
-                if val: settings['COOLDOWN_HOURS'] = float(val)
-                
-                print("\n*** New Ruleset Applied: ***")
-                for k, v in settings.items():
-                    print(f"  {k} = {v}")
-        except Exception as e:
-            print(f"Interactive setup skipped: {e}")
+    # ── Preset tanımları ──────────────────────────────────────────────────────
+    PRESETS = {
+        "ana": {
+            "_name": "Ana Kurallar (Production)",
+            "_desc": "Düşük riskli, uzun vadeli, yüksek güven filtreli üretim kuralları.",
+            "RISK_REWARD_RATIO":   2.5,
+            "SL_ATR_MULTIPLIER":   1.5,
+            "CONFIDENCE_THRESHOLD": 0.65,
+            "ADX_MINIMUM":         25.0,
+            "COOLDOWN_HOURS":       8.0,
+        },
+        "test": {
+            "_name": "Test Kuralları (MAKSIMUM AGRESIF -- Aninda Pozisyon)",
+            "_desc": "Tum filtreler kapatildi -- model sinyali gelir gelmez pozisyona girer. DIKKAT: Canli hesapta kucuk lot kullanin!",
+            "RISK_REWARD_RATIO":    1.0,   # 1:1 R/R
+            "SL_ATR_MULTIPLIER":    0.5,   # Dar SL
+            "CONFIDENCE_THRESHOLD": 0.50,  # Alt sinir -- herhangi bir yon yeterli
+            "ADX_MINIMUM":          0.0,   # ADX filtresi KAPALI
+            "COOLDOWN_HOURS":       0.0,   # Bekleme YOK
+            "META_CONF_MIN":        0.0,   # Meta model filtresi TAMAMEN BYPASS
+        },
+    }
 
-        print("\n*** Starting Engine... ***\n")
+    def _print_preset(label: str, p: dict):
+        print(f"\n  [{label.upper()}] {p['_name']}")
+        print(f"  {p['_desc']}")
+        for k, v in p.items():
+            if not k.startswith("_"):
+                print(f"    • {k:<26} = {v}")
+
+    def run_interactive_wizard():
+        print()
+        print("╔══════════════════════════════════════════════════════╗")
+        print("║       BORSABOT — TRADE RULESET (BAŞLANGIÇ MENÜSÜ)   ║")
+        print("╚══════════════════════════════════════════════════════╝")
+
+        # Preset özetleri
+        for key, preset in PRESETS.items():
+            _print_preset(key, preset)
+
+        print()
+        print("══════════════════════════════════════════════════════")
+        print("  Seçenekler:")
+        print("    [1]  Ana Kurallar  — Üretim preset'i")
+        print("    [2]  Test Kuralları — Agresif / veri toplama preset'i")
+        print("    [3]  Özel Düzenle  — Kendi değerlerini gir")
+        print("    [ENTER] → Varsayılan (Ana Kurallar)")
+        print("══════════════════════════════════════════════════════")
+
+        try:
+            raw = input("  Seçiminiz [1/2/3, ENTER=1]: ").strip()
+        except Exception:
+            raw = ""
+
+        # ── Seçim: preset veya edit ───────────────────────────────────────────
+        if raw in ("", "1"):
+            chosen = dict(PRESETS["ana"])
+            print(f"\n✅  Ana Kurallar seçildi.")
+
+        elif raw == "2":
+            chosen = dict(PRESETS["test"])
+            print(f"\n✅  Test Kuralları seçildi.")
+
+        elif raw == "3":
+            # Ana preset başlangıç noktası olsun
+            chosen = dict(PRESETS["ana"])
+            print("\n  Düzenleme modu — boş bırakılırsa mevcut değer korunur:")
+
+            def _ask(key: str, typ=float):
+                cur = chosen[key]
+                try:
+                    val = input(f"    {key} [{cur}]: ").strip()
+                    if val:
+                        chosen[key] = typ(val)
+                except Exception:
+                    pass
+
+            _ask("RISK_REWARD_RATIO")
+            _ask("SL_ATR_MULTIPLIER")
+            _ask("CONFIDENCE_THRESHOLD")
+            _ask("ADX_MINIMUM")
+            _ask("COOLDOWN_HOURS")
+            print("\n  ✅  Özel ruleset kaydedildi.")
+
+        else:
+            print("  ⚠️  Geçersiz seçim — Ana Kurallar kullanılıyor.")
+            chosen = dict(PRESETS["ana"])
+
+        # Sadece trade parametrelerini döndür (_name, _desc komple at)
+        settings = {k: v for k, v in chosen.items() if not k.startswith("_")}
+
+        print()
+        print("  Aktif Kural Seti:")
+        for k, v in settings.items():
+            print(f"    {k:<26} = {v}")
+        print()
+        print("  *** Engine başlatılıyor... ***")
+        print()
         return settings
 
     user_settings = run_interactive_wizard()

@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# Virtual environment - ASLA push yapilmasin (cok buyuk)
+venv/
+.venv/
+env/
+ENV/
+
+# Build / egg-info
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment / secrets - ASLA push yapilmasin
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs (buyuk log dosyalari)
+logs/main_test_out.txt
+logs/dash_debug.txt
+
+# Data / Parquet lake (buyuk olabilir)
+data/lake/
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Docker volumes
+monitoring/grafana/data/
