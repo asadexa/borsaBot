@@ -51,3 +51,12 @@ htmlcov/
 
 # Docker volumes
 monitoring/grafana/data/
+
+# PyInstaller EXE build artifacts
+build/
+dist/
+*.spec.bak
+launcher/hooks/
+
+# UPX (isteğe bağlı sıkıştırma aracı)
+upx*.exe
