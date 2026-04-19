@@ -1,0 +1,15 @@
+﻿{
+    "mt5_password":  "ZgWr*3Km",
+    "paper_mode":  false,
+    "mt5_account":  "104707121",
+    "nav_usd":  "3000",
+    "default_symbols":  "EURUSD",
+    "binance_testnet":  true,
+    "binance_key":  "CkFCt0czz9vWpcnrPqGpIaVEmsbR4CrSDfCnjI04eP3H8wiowGgEpGnCXeUqfoNl",
+    "mt5_server":  "MetaQuotes-Demo",
+    "broker":  "mt5",
+    "setup_complete":  true,
+    "preset":  "ana",
+    "binance_secret":  "eogx2lyoF1EaSR1MWTBzCjWqVhvhgdyigePQkGKIWo0Ja1EKnKD4ychyzoKM1Q5o",
+    "setup_version":  "2.0"
+}

@@ -1,571 +1,1773 @@
 """
-BorsaBot Launcher — Production EXE Entry Point
-Tüm bağımlılıkları kontrol ederek Engine ve Dashboard'u başlatır.
+BorsaBot Complete Setup & Launcher v2.0
+
+Ilk calistirmada: Kurulum sihirbazi
+  1. Internet kontrol
+  2. Docker Desktop kur/baslat
+  3. Docker servisleri baslat (timescaledb, redis, prometheus, grafana)
+  4. MetaTrader 5 kur
+  5. MT5 Algoritmik Ticaret ayarini aktif et
+  6. Hesap bilgileri gir (.env olustur)
+  7. Tamamla
+
+Sonraki calistirmalarda: Tek tikla tum sistemi ayaga kaldir
 """
 from __future__ import annotations
 
+import io
+import json
 import os
-import sys
+import queue
+import shutil
 import subprocess
-import time
+import sys
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, font
+import time
+import urllib.request
+import webbrowser
 from pathlib import Path
+from typing import Callable
 
-# ── PyInstaller: çalışma dizinini exe'nin bulunduğu klasöre ayarla ────────────
+import tkinter as tk
+from tkinter import ttk, messagebox, font as tkfont
+
+# ─── UTF-8 stdout zorla (Windows konsol encoding sorunu icin) ─────────────────
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths & URLs
+# ─────────────────────────────────────────────────────────────────────────────
 if getattr(sys, "frozen", False):
-    # Exe ile çalışıyoruz
     BASE_DIR = Path(sys.executable).parent
 else:
-    # Doğrudan Python ile çalışıyoruz
     BASE_DIR = Path(__file__).parent.parent
 
-# .env dosyasını yükle (en başta)
-_env_path = BASE_DIR / ".env"
-if _env_path.exists():
-    for line in _env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            v = v.split("#")[0].strip()
-            os.environ.setdefault(k.strip(), v)
+SETUP_FILE   = BASE_DIR / ".borsabot_setup.json"
+ENV_FILE     = BASE_DIR / ".env"
+ENV_EXAMPLE  = BASE_DIR / ".env.example"
+MODEL_DIR    = BASE_DIR / "models"
+SCRIPTS_DIR  = BASE_DIR / "scripts"
+COMPOSE_FILE = BASE_DIR / "docker-compose.yml"
+LOG_DIR      = BASE_DIR / "logs"
+TEMP_DIR     = BASE_DIR / ".installer_tmp"
 
-MODEL_DIR  = BASE_DIR / "models"
-SCRIPTS_DIR = BASE_DIR / "scripts"
+DOCKER_URL = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+MT5_URL    = "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
 
+DOCKER_EXE = Path("C:/Program Files/Docker/Docker/Docker Desktop.exe")
+MT5_EXE    = Path("C:/Program Files/MetaTrader 5/terminal64.exe")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Design tokens
 # ─────────────────────────────────────────────────────────────────────────────
+BG      = "#0d1117"
+PANEL   = "#161b22"
+BORDER  = "#30363d"
+ACCENT  = "#58a6ff"
+GREEN   = "#3fb950"
+RED     = "#f85149"
+YELLOW  = "#d29922"
+PURPLE  = "#bc8cff"
+TEXT    = "#e6edf3"
+MUTED   = "#8b949e"
+INPUT   = "#21262d"
 
-def _run_detached(cmd: list[str], title: str, cwd: Path) -> subprocess.Popen:
-    """Ayrı bir konsol penceresinde komut çalıştır (Windows)."""
-    startupinfo = subprocess.STARTUPINFO()
-    creationflags = subprocess.CREATE_NEW_CONSOLE
-    return subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        creationflags=creationflags,
-        startupinfo=startupinfo,
-    )
+# ─────────────────────────────────────────────────────────────────────────────
+# Setup State (JSON-backed)
+# ─────────────────────────────────────────────────────────────────────────────
+_DEFAULT_STATE: dict = {
+    "setup_complete":  False,
+    "setup_version":   "2.0",
+    "broker":          "mt5",
+    "mt5_account":     "",
+    "mt5_password":    "",
+    "mt5_server":      "",
+    "binance_key":     "",
+    "binance_secret":  "",
+    "binance_testnet": True,
+    "default_symbols": "EURUSD",
+    "nav_usd":         "3000",
+    "paper_mode":      False,
+    "preset":          "ana",
+}
 
 
-def _check_docker() -> bool:
+def _load_env_values() -> dict:
+    """Mevcut .env dosyasindan hesap bilgilerini oku."""
+    mapping = {
+        "MT5_ACCOUNT":      "mt5_account",
+        "MT5_PASSWORD":     "mt5_password",
+        "MT5_SERVER":       "mt5_server",
+        "BINANCE_API_KEY":  "binance_key",
+        "BINANCE_API_SECRET": "binance_secret",
+        "DEFAULT_SYMBOLS":  "default_symbols",
+        "NAV_USD":          "nav_usd",
+    }
+    result = {}
+    if not ENV_FILE.exists():
+        return result
     try:
-        result = subprocess.run(
-            ["docker", "ps"], capture_output=True, timeout=5
-        )
-        return result.returncode == 0
+        for line in ENV_FILE.read_text("utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.split("#")[0].strip()   # inline yorumlari at
+            if key in mapping and val:
+                result[mapping[key]] = val
+    except Exception:
+        pass
+    return result
+
+
+def load_state() -> dict:
+    if SETUP_FILE.exists():
+        try:
+            saved = {**_DEFAULT_STATE, **json.loads(SETUP_FILE.read_text("utf-8"))}
+        except Exception:
+            saved = dict(_DEFAULT_STATE)
+    else:
+        saved = dict(_DEFAULT_STATE)
+    # .env'deki hesap bilgileri state'i ezer (tek kaynak)
+    env_creds = _load_env_values()
+    for k in ["mt5_account", "mt5_password", "mt5_server",
+              "binance_key", "binance_secret",
+              "default_symbols", "nav_usd"]:
+        if env_creds.get(k):
+            saved[k] = env_creds[k]
+    return saved
+
+
+def save_state(state: dict) -> None:
+    try:
+        SETUP_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def write_env(state: dict) -> None:
+    lines = [
+        "# BorsaBot Environment -- Auto-generated by BorsaBot Launcher v2.0",
+        "",
+        "# MetaTrader 5",
+        f"MT5_ACCOUNT={state.get('mt5_account', '')}",
+        f"MT5_PASSWORD={state.get('mt5_password', '')}",
+        f"MT5_SERVER={state.get('mt5_server', '')}",
+        "",
+        "# Binance",
+        f"BINANCE_API_KEY={state.get('binance_key', '')}",
+        f"BINANCE_API_SECRET={state.get('binance_secret', '')}",
+        f"BINANCE_TESTNET={'true' if state.get('binance_testnet', True) else 'false'}",
+        "",
+        "# Trading",
+        f"DEFAULT_SYMBOLS={state.get('default_symbols', 'EURUSD')}",
+        f"NAV_USD={state.get('nav_usd', '3000')}",
+        "LOG_LEVEL=INFO",
+        "",
+        "# Infrastructure",
+        "TIMESCALE_DSN=postgresql://borsabot:borsabot@localhost:5432/borsabot",
+        "REDIS_URL=redis://localhost:6379/0",
+        "ZMQ_PUB_ADDR=tcp://127.0.0.1:5555",
+        "ZMQ_SUB_ADDR=tcp://127.0.0.1:5555",
+        "",
+        "# Risk Parameters",
+        "MAX_POSITION_USD=50000",
+        "MAX_PORTFOLIO_PCT=0.10",
+        "MAX_DRAWDOWN_PCT=0.05",
+    ]
+    LOG_DIR.mkdir(exist_ok=True)
+    ENV_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_internet() -> bool:
+    try:
+        urllib.request.urlopen("https://www.google.com", timeout=6)
+        return True
     except Exception:
         return False
 
 
-def _check_mt5_running() -> bool:
+def check_docker_installed() -> bool:
+    return DOCKER_EXE.exists()
+
+
+def check_docker_running() -> bool:
     try:
-        result = subprocess.run(
+        r = subprocess.run(["docker", "ps"], capture_output=True, timeout=6)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def check_mt5_installed() -> bool:
+    return MT5_EXE.exists()
+
+
+def check_mt5_running() -> bool:
+    try:
+        r = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq terminal64.exe"],
             capture_output=True, text=True, timeout=5
         )
-        return "terminal64.exe" in result.stdout
+        return "terminal64.exe" in r.stdout
     except Exception:
         return False
 
 
-def _docker_services_up(cwd: Path) -> bool:
-    """docker compose up -d servislerini başlat."""
+def check_models_exist() -> bool:
+    return MODEL_DIR.exists() and len(list(MODEL_DIR.glob("*.pkl"))) > 0
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> tuple[bool, str]:
+    """Dosya indir. Dogruluk: (basarili, hata_mesaji)"""
     try:
-        result = subprocess.run(
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "BorsaBot-Launcher/2.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb:
+                        progress_cb(downloaded, total)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def start_docker_desktop(status_cb: Callable[[str], None] | None = None) -> bool:
+    """Docker Desktop'i ac ve daemon hazir olana dek bekle."""
+    if check_docker_running():
+        return True
+    if not DOCKER_EXE.exists():
+        return False
+    subprocess.Popen([str(DOCKER_EXE)], creationflags=subprocess.DETACHED_PROCESS)
+    if status_cb:
+        status_cb("Docker Desktop baslatildi, daemon bekleniyor...")
+    for i in range(90):          # max 3 dakika
+        time.sleep(2)
+        if check_docker_running():
+            return True
+        if status_cb and i % 5 == 0:
+            status_cb(f"Docker hazirlanıyor... ({i*2}s)")
+    return False
+
+
+def start_docker_services(status_cb: Callable[[str], None] | None = None) -> bool:
+    """docker compose up -d ile servisleri baslat."""
+    if not COMPOSE_FILE.exists():
+        return False
+    try:
+        subprocess.run(
             ["docker", "compose", "up", "-d",
              "timescaledb", "redis", "prometheus", "grafana"],
-            cwd=str(cwd), capture_output=True, timeout=60
+            cwd=str(BASE_DIR), capture_output=True, timeout=180
         )
-        return result.returncode == 0
-    except Exception:
+        if status_cb:
+            status_cb("Docker servisleri baslatildi.")
+        return True
+    except Exception as e:
+        if status_cb:
+            status_cb(f"Docker servisleri hatasi: {e}")
         return False
 
 
-def _get_python_exe() -> str:
-    """EXE içinde gömülü Python kullanılır; doğrudan scriptler için sistem Python."""
-    if getattr(sys, "frozen", False):
-        return sys.executable
-    # Geliştirme modunda venv veya sistem Python
-    venv_py = BASE_DIR / "venv" / "Scripts" / "python.exe"
-    if venv_py.exists():
-        return str(venv_py)
-    return sys.executable
+def open_mt5() -> bool:
+    if not MT5_EXE.exists():
+        return False
+    if check_mt5_running():
+        return True
+    subprocess.Popen([str(MT5_EXE)])
+    time.sleep(6)
+    return check_mt5_running()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GUI Launcher
+# MT5 Config Patching
 # ─────────────────────────────────────────────────────────────────────────────
 
-class BorsaBotLauncher(tk.Tk):
-    DARK_BG   = "#0d1117"
-    PANEL_BG  = "#161b22"
-    ACCENT    = "#58a6ff"
-    SUCCESS   = "#3fb950"
-    ERROR     = "#f85149"
-    WARNING   = "#d29922"
-    TEXT      = "#e6edf3"
-    MUTED     = "#8b949e"
-    BORDER    = "#30363d"
+def find_mt5_terminal_inis() -> list[Path]:
+    appdata = Path(os.environ.get("APPDATA", ""))
+    root = appdata / "MetaQuotes" / "Terminal"
+    if not root.exists():
+        return []
+    result = []
+    for folder in root.iterdir():
+        if folder.is_dir():
+            ini = folder / "config" / "terminal.ini"
+            if ini.exists():
+                result.append(ini)
+    return result
 
-    def __init__(self):
-        super().__init__()
-        self.title("BorsaBot — Production Launcher")
-        self.geometry("760x660")
-        self.resizable(False, False)
-        self.configure(bg=self.DARK_BG)
-        self._set_icon()
 
-        self._procs: list[subprocess.Popen] = []
-        self._engine_running  = False
-        self._dash_running    = False
+def _read_ini_bytes(path: Path) -> tuple[str, str]:
+    """INI dosyasini oku. (icerik, encoding) dondur."""
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace"), "utf-16"
+    return raw.decode("utf-8", errors="replace"), "utf-8"
 
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # İlk kontrol gecikmeli (UI tamamen yüklendikten sonra)
-        self.after(300, self._initial_check)
+def _set_ini_value(content: str, section: str, key: str, value: str) -> str:
+    """INI icinde bir deger ayarla (yoksa ekle)."""
+    lines = content.splitlines()
+    in_section = False
+    key_found = False
+    result = []
+    section_exists = any(l.strip().lower() == f"[{section.lower()}]" for l in lines)
 
-    # ── Icon ─────────────────────────────────────────────────────────────────
-    def _set_icon(self):
-        icon_path = BASE_DIR / "launcher" / "icon.ico"
-        if icon_path.exists():
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower() == f"[{section.lower()}]":
+            in_section = True
+            result.append(line)
+            continue
+        if stripped.startswith("[") and stripped != f"[{section}]":
+            if in_section and not key_found:
+                result.append(f"{key}={value}")
+                key_found = True
+            in_section = False
+            result.append(line)
+            continue
+        if in_section and stripped.lower().startswith(f"{key.lower()}="):
+            result.append(f"{key}={value}")
+            key_found = True
+            continue
+        result.append(line)
+
+    if in_section and not key_found:
+        result.append(f"{key}={value}")
+    elif not section_exists:
+        result += ["", f"[{section}]", f"{key}={value}"]
+
+    return "\n".join(result)
+
+
+def patch_mt5_algo_trading() -> tuple[bool, str]:
+    """MT5 terminal.ini dosyalarinda Algoritmik Ticaret'i aktif et."""
+    inis = find_mt5_terminal_inis()
+    if not inis:
+        return False, "terminal.ini bulunamadi — MT5 en az bir kez acilmis olmali"
+
+    patched = 0
+    for path in inis:
+        try:
+            content, enc = _read_ini_bytes(path)
+            for section, key, val in [
+                ("Experts", "Enabled", "1"),
+                ("Experts", "AllowLiveTrading", "1"),
+                ("Experts", "AllowDllImport", "0"),
+            ]:
+                content = _set_ini_value(content, section, key, val)
+            if enc == "utf-16":
+                path.write_bytes(content.encode("utf-16"))
+            else:
+                path.write_text(content, encoding="utf-8")
+            patched += 1
+        except PermissionError:
+            continue
+        except Exception:
+            continue
+
+    if patched > 0:
+        return True, f"{patched}/{len(inis)} MT5 konfigurasyonu guncellendi"
+    return False, "terminal.ini yazma izni reddedildi — yonetici olarak calistirin"
+
+
+def verify_mt5_python_api() -> tuple[bool, str]:
+    """MetaTrader5 Python paketinin MT5'e baglanabildigini kontrol et."""
+    try:
+        import MetaTrader5 as mt5
+        if mt5.initialize():
+            info = mt5.terminal_info()
+            mt5.shutdown()
+            if info and info.trade_allowed:
+                return True, "MT5 Python API: Bagli ve ticaret aktif"
+            elif info:
+                return False, "MT5 bagli FAKAT ticaret izni kapali — Algo Trading aktif etmeniz gerekiyor"
+            return True, "MT5 Python API: Bagli"
+        else:
+            err = mt5.last_error()
+            return False, f"MT5 baglantisi kurulamadi: {err}"
+    except ImportError:
+        return False, "MetaTrader5 Python paketi bulunamadi"
+    except Exception as e:
+        return False, f"MT5 API hatasi: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Threading Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TaskRunner:
+    """Arka plan gorevi calistir, UI guncelleme kuyrugu ile."""
+
+    def __init__(self, app: tk.Tk):
+        self._app = app
+        self._queue: queue.Queue = queue.Queue()
+        self._polling = False
+
+    def run(self, func: Callable, on_done: Callable | None = None):
+        def _worker():
             try:
-                self.iconbitmap(str(icon_path))
+                result = func()
+                self._queue.put(("done", result))
+            except Exception as e:
+                self._queue.put(("error", str(e)))
+
+        self._start_poll()
+        threading.Thread(target=_worker, daemon=True).start()
+        if on_done:
+            self._on_done = on_done
+
+    def put(self, msg):
+        self._queue.put(("msg", msg))
+
+    def _start_poll(self):
+        if not self._polling:
+            self._polling = True
+            self._poll()
+
+    def _poll(self):
+        try:
+            while True:
+                kind, val = self._queue.get_nowait()
+                if kind == "done" and hasattr(self, "_on_done"):
+                    self._on_done(val)
+                elif kind == "error":
+                    pass
+        except queue.Empty:
+            pass
+        self._app.after(100, self._poll)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI Helper: styled widgets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def styled_btn(parent, text, command, color=ACCENT, width=18, **kw):
+    return tk.Button(
+        parent, text=text, command=command,
+        bg=color, fg="white", relief="flat",
+        activebackground=color, activeforeground="white",
+        cursor="hand2", padx=14, pady=7, bd=0,
+        font=tkfont.Font(family="Segoe UI", size=10, weight="bold"),
+        width=width, **kw
+    )
+
+
+def separator(parent):
+    return tk.Frame(parent, bg=BORDER, height=1)
+
+
+def label(parent, text, style="body", fg=TEXT, **kw):
+    fonts = {
+        "h1":   tkfont.Font(family="Segoe UI", size=20, weight="bold"),
+        "h2":   tkfont.Font(family="Segoe UI", size=13, weight="bold"),
+        "h3":   tkfont.Font(family="Segoe UI", size=10, weight="bold"),
+        "body": tkfont.Font(family="Segoe UI", size=9),
+        "muted":tkfont.Font(family="Segoe UI", size=8),
+        "mono": tkfont.Font(family="Consolas",  size=8),
+    }
+    return tk.Label(parent, text=text, fg=fg, bg=BG, font=fonts.get(style, fonts["body"]), **kw)
+
+
+def entry(parent, textvariable, show=None, width=28):
+    return tk.Entry(
+        parent, textvariable=textvariable, show=show,
+        bg=INPUT, fg=TEXT, insertbackground=TEXT,
+        relief="flat", bd=0, width=width,
+        font=tkfont.Font(family="Segoe UI", size=9),
+        highlightthickness=1, highlightcolor=ACCENT,
+        highlightbackground=BORDER,
+    )
+
+
+def status_icon(parent, ok: bool | None = None) -> tk.Label:
+    text  = "●" if ok is None else ("✓" if ok else "✗")
+    color = YELLOW if ok is None else (GREEN if ok else RED)
+    return tk.Label(parent, text=text, fg=color, bg=BG,
+                    font=tkfont.Font(family="Segoe UI", size=12, weight="bold"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wizard Base Page
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BasePage(tk.Frame):
+    def __init__(self, master, app, state: dict):
+        super().__init__(master, bg=BG)
+        self.app   = app
+        self.state = state
+
+    def on_show(self):
+        """Sayfa gosterildiginde cagrilir."""
+        pass
+
+    def _row(self, pady=4) -> tk.Frame:
+        f = tk.Frame(self, bg=BG)
+        f.pack(fill="x", padx=32, pady=pady)
+        return f
+
+    def _header(self, icon: str, title: str, subtitle: str = ""):
+        hdr = tk.Frame(self, bg=PANEL, pady=20)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=icon, fg=ACCENT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=30)).pack()
+        tk.Label(hdr, text=title, fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=16, weight="bold")).pack()
+        if subtitle:
+            tk.Label(hdr, text=subtitle, fg=MUTED, bg=PANEL,
+                     font=tkfont.Font(family="Segoe UI", size=9)).pack(pady=(4, 0))
+        separator(self).pack(fill="x")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 0: Welcome / First Run Detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WelcomePage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._build()
+
+    def _build(self):
+        # Big header
+        tk.Frame(self, bg=BG, height=30).pack()
+        tk.Label(self, text="⚡", fg=ACCENT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=56)).pack()
+        tk.Label(self, text="BorsaBot", fg=TEXT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=28, weight="bold")).pack()
+        tk.Label(self, text="AI-Native Algorithmic Trading Platform",
+                 fg=MUTED, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=10)).pack(pady=(4, 0))
+
+        tk.Frame(self, bg=BG, height=24).pack()
+        separator(self).pack(fill="x", padx=40)
+        tk.Frame(self, bg=BG, height=20).pack()
+
+        # Info panel
+        info = tk.Frame(self, bg=PANEL, bd=0, highlightthickness=1,
+                        highlightbackground=BORDER, padx=20, pady=16)
+        info.pack(padx=60, fill="x")
+        tk.Label(info, text="Ilk kurulum baslatilacak. Bu islem:",
+                 fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack(anchor="w")
+        for item in [
+            "✓  Internet baglanitisini kontrol eder",
+            "✓  Docker Desktop'i otomatik kurar (gerekirse)",
+            "✓  MetaTrader 5'i otomatik kurar (gerekirse)",
+            "✓  Algoritmik ticaret ayarlarini aktif eder",
+            "✓  Hesap bilgilerinizi guvenle kaydeder",
+            "✓  Tum servisleri ayaga kaldirir",
+        ]:
+            tk.Label(info, text=item, fg=MUTED, bg=PANEL,
+                     font=tkfont.Font(family="Segoe UI", size=9),
+                     anchor="w").pack(anchor="w", pady=1)
+
+        tk.Frame(self, bg=BG, height=28).pack()
+
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.pack()
+        styled_btn(btn_frame, "  Kurulumu Baslat  ", self._next,
+                   color=GREEN, width=22).pack(side="left", padx=8)
+        styled_btn(btn_frame, "  Atla (Kurulu)  ",
+                   lambda: self.app.go_main(),
+                   color=PANEL, width=20).pack(side="left", padx=8)
+
+    def _next(self):
+        self.app.show_page("internet")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1: Internet Check
+# ─────────────────────────────────────────────────────────────────────────────
+
+class InternetPage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._build()
+
+    def _build(self):
+        self._header("🌐", "Internet Baglantisi",
+                     "Kurulum ve indirmeler icin internet gereklidir")
+
+        tk.Frame(self, bg=BG, height=20).pack()
+
+        self._icon_var = tk.StringVar(value="⏳")
+        self._icon_color = [YELLOW]
+        self._icon_lbl = tk.Label(self, textvariable=self._icon_var, fg=YELLOW,
+                                  bg=BG, font=tkfont.Font(family="Segoe UI", size=48))
+        self._icon_lbl.pack()
+
+        self._status_var = tk.StringVar(value="Kontrol ediliyor...")
+        tk.Label(self, textvariable=self._status_var, fg=TEXT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=11)).pack(pady=8)
+
+        self._detail_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._detail_var, fg=MUTED, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack()
+
+        tk.Frame(self, bg=BG, height=24).pack()
+
+        self._btn_frame = tk.Frame(self, bg=BG)
+        self._btn_frame.pack()
+
+        self._next_btn = styled_btn(self._btn_frame, "Devam Et →", self._next,
+                                    color=GREEN, width=20)
+        self._retry_btn = styled_btn(self._btn_frame, "Tekrar Dene", self._check,
+                                     color=YELLOW, width=16)
+
+    def on_show(self):
+        self._check()
+
+    def _check(self):
+        self._status_var.set("Kontrol ediliyor...")
+        self._icon_var.set("⏳")
+        self._icon_lbl.config(fg=YELLOW)
+        self._detail_var.set("")
+        for w in self._btn_frame.winfo_children():
+            w.pack_forget()
+        threading.Thread(target=self._do_check, daemon=True).start()
+
+    def _do_check(self):
+        ok = check_internet()
+        self.app.after(0, lambda: self._done(ok))
+
+    def _done(self, ok: bool):
+        if ok:
+            self._icon_var.set("✓")
+            self._icon_lbl.config(fg=GREEN)
+            self._status_var.set("Internet baglantisi aktif!")
+            self._detail_var.set("Kurulum icin gerekli dosyalar indirilebilir.")
+            self._next_btn.pack(side="left", padx=8)
+            self.app.after(1200, self._next)
+        else:
+            self._icon_var.set("✗")
+            self._icon_lbl.config(fg=RED)
+            self._status_var.set("Internet baglantisi bulunamadi!")
+            self._detail_var.set(
+                "Lutfen internet baglantinizi kontrol edin.\n"
+                "Kurulum tamamlandiktan sonra internet olmadan da calisabilir."
+            )
+            self._retry_btn.pack(side="left", padx=8)
+            styled_btn(self._btn_frame, "Yine de Devam", self._next,
+                       color=YELLOW, width=18).pack(side="left", padx=8)
+
+    def _next(self):
+        self.app.show_page("docker_install")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2: Docker Installation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DockerInstallPage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._build()
+
+    def _build(self):
+        self._header("🐳", "Docker Desktop",
+                     "TimescaleDB, Redis, Grafana ve Prometheus icin gerekli")
+
+        tk.Frame(self, bg=BG, height=12).pack()
+
+        # Status card
+        card = tk.Frame(self, bg=PANEL, padx=20, pady=16,
+                        highlightbackground=BORDER, highlightthickness=1)
+        card.pack(padx=32, fill="x", pady=8)
+
+        self._phase_var = tk.StringVar(value="Kontrol ediliyor...")
+        tk.Label(card, textvariable=self._phase_var, fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=11, weight="bold"),
+                 anchor="w").pack(fill="x")
+
+        self._status_var = tk.StringVar(value="")
+        tk.Label(card, textvariable=self._status_var, fg=MUTED, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9), anchor="w",
+                 wraplength=520).pack(fill="x", pady=(4, 0))
+
+        # Progress bar
+        self._progress = ttk.Progressbar(card, mode="indeterminate", length=500)
+        self._progress.pack(fill="x", pady=8)
+
+        # Log box
+        log_frame = tk.Frame(self, bg=PANEL, padx=10, pady=6,
+                             highlightbackground=BORDER, highlightthickness=1)
+        log_frame.pack(padx=32, fill="x", pady=4)
+        self._log = tk.Text(log_frame, bg="#0a0e14", fg=TEXT, height=6,
+                            state="disabled", font=tkfont.Font(family="Consolas", size=8),
+                            bd=0, wrap="word")
+        self._log.pack(fill="x")
+
+        tk.Frame(self, bg=BG, height=10).pack()
+
+        self._btn_frame = tk.Frame(self, bg=BG)
+        self._btn_frame.pack()
+
+    def on_show(self):
+        self._log_line("Docker kontrolu baslatiliyor...")
+        threading.Thread(target=self._do_flow, daemon=True).start()
+
+    def _log_line(self, msg: str, color: str = TEXT):
+        def _update():
+            self._log.configure(state="normal")
+            self._log.insert("end", f"{msg}\n")
+            self._log.see("end")
+            self._log.configure(state="disabled")
+        self.app.after(0, _update)
+
+    def _set_phase(self, text: str):
+        self.app.after(0, lambda: self._phase_var.set(text))
+
+    def _set_status(self, text: str):
+        self.app.after(0, lambda: self._status_var.set(text))
+
+    def _progress_cb(self, done: int, total: int):
+        if total > 0:
+            pct = int(done / total * 100)
+            self.app.after(0, lambda: self._set_status(
+                f"Indiriliyor... {done//1_048_576}MB / {total//1_048_576}MB ({pct}%)"
+            ))
+
+    def _do_flow(self):
+        # 1. Installed?
+        if check_docker_installed():
+            self._set_phase("Docker Desktop kurulu.")
+            self._log_line("[OK] Docker Desktop bulundu.")
+        else:
+            self._set_phase("Docker Desktop kuruluyor...")
+            self._log_line("[..] Docker Desktop bulunamadi -- indiriliyor (~600MB)...")
+            dl_path = TEMP_DIR / "DockerDesktopInstaller.exe"
+            ok, err = download_file(DOCKER_URL, dl_path, self._progress_cb)
+            if not ok:
+                self._log_line(f"[HATA] Indirme basarisiz: {err}")
+                self.app.after(0, self._show_docker_error)
+                return
+            self._log_line("[OK] Indirme tamamlandi. Kuruluyor...")
+            self._set_phase("Docker Desktop yukleniyor (1-2 dakika)...")
+            ret = subprocess.run(
+                [str(dl_path), "install", "--quiet", "--accept-license"],
+                capture_output=True, timeout=300
+            )
+            if ret.returncode not in (0, 3010):  # 3010 = restart required (ok)
+                self._log_line(f"[HATA] Kurulum kodu: {ret.returncode}")
+                self.app.after(0, self._show_docker_error)
+                return
+            self._log_line("[OK] Docker Desktop kuruldu.")
+
+        # 2. Start Docker
+        self._set_phase("Docker Desktop baslatiliyor...")
+        self._log_line("[..] Docker daemon bekleniyor (max 3 dakika)...")
+        self.app.after(0, self._progress.start)
+
+        ok = start_docker_desktop(lambda m: self._log_line(m))
+        self.app.after(0, self._progress.stop)
+
+        if not ok:
+            self._log_line("[HATA] Docker daemon baslamadi!")
+            self.app.after(0, self._show_docker_error)
+            return
+
+        self._log_line("[OK] Docker hazir!")
+        self._set_phase("Docker servisleri baslatiliyor...")
+
+        # 3. Start services
+        ok = start_docker_services(lambda m: self._log_line(m))
+        if ok:
+            self._log_line("[OK] Tum servisler calistriyor.")
+        else:
+            self._log_line("[!!] Servisler baslatılamadi -- devam ediliyor.")
+
+        self._log_line("[=>] Sonraki adima geciliyor...")
+        self.app.after(1200, lambda: self.app.show_page("mt5_install"))
+
+    def _show_docker_error(self):
+        self._set_phase("Docker kurulumu basarisiz!")
+        styled_btn(self._btn_frame, "Tekrar Dene", self.on_show,
+                   color=YELLOW, width=16).pack(side="left", padx=8)
+        styled_btn(self._btn_frame, "Atla", lambda: self.app.show_page("mt5_install"),
+                   color=MUTED, width=14).pack(side="left", padx=8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3: MetaTrader 5 Installation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MT5InstallPage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._build()
+
+    def _build(self):
+        self._header("📊", "MetaTrader 5",
+                     "Forex ve emtia brokeriyle baglanti icin gerekli")
+
+        tk.Frame(self, bg=BG, height=12).pack()
+
+        card = tk.Frame(self, bg=PANEL, padx=20, pady=16,
+                        highlightbackground=BORDER, highlightthickness=1)
+        card.pack(padx=32, fill="x", pady=8)
+
+        self._phase_var = tk.StringVar(value="Kontrol ediliyor...")
+        tk.Label(card, textvariable=self._phase_var, fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=11, weight="bold"),
+                 anchor="w").pack(fill="x")
+
+        self._status_var = tk.StringVar(value="")
+        tk.Label(card, textvariable=self._status_var, fg=MUTED, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9), anchor="w",
+                 wraplength=520).pack(fill="x", pady=(4, 0))
+
+        self._progress = ttk.Progressbar(card, mode="indeterminate", length=500)
+        self._progress.pack(fill="x", pady=8)
+
+        log_frame = tk.Frame(self, bg=PANEL, padx=10, pady=6,
+                             highlightbackground=BORDER, highlightthickness=1)
+        log_frame.pack(padx=32, fill="x", pady=4)
+        self._log = tk.Text(log_frame, bg="#0a0e14", fg=TEXT, height=5,
+                            state="disabled", font=tkfont.Font(family="Consolas", size=8),
+                            bd=0, wrap="word")
+        self._log.pack(fill="x")
+
+        tk.Frame(self, bg=BG, height=10).pack()
+        self._btn_frame = tk.Frame(self, bg=BG)
+        self._btn_frame.pack()
+
+    def on_show(self):
+        threading.Thread(target=self._do_flow, daemon=True).start()
+
+    def _log_line(self, msg):
+        def _u():
+            self._log.configure(state="normal")
+            self._log.insert("end", f"{msg}\n")
+            self._log.see("end")
+            self._log.configure(state="disabled")
+        self.app.after(0, _u)
+
+    def _do_flow(self):
+        if check_mt5_installed():
+            self._log_line("[OK] MetaTrader 5 kurulu.")
+            self.app.after(0, lambda: self._phase_var.set("MetaTrader 5 zaten yuklu."))
+        else:
+            self.app.after(0, lambda: self._phase_var.set("MetaTrader 5 indiriliyor..."))
+            self._log_line("[..] MT5 bulunamadi -- indiriliyor (~5MB)...")
+            dl = TEMP_DIR / "mt5setup.exe"
+            ok, err = download_file(MT5_URL, dl,
+                                    lambda d, t: self.app.after(0, lambda: self._status_var.set(
+                                        f"Indiriliyor... {d//1024}KB")))
+            if not ok:
+                self._log_line(f"[HATA] {err}")
+                self.app.after(0, self._show_error)
+                return
+            self._log_line("[OK] Indirme tamamlandi. Yukleyici baslatiliyor...")
+            self.app.after(0, lambda: self._phase_var.set("MT5 kuruluyor..."))
+            self.app.after(0, self._progress.start)
+            ret = subprocess.run([str(dl), "/auto"], timeout=300, capture_output=True)
+            self.app.after(0, self._progress.stop)
+            # /auto opens MT5 after install — wait a moment
+            time.sleep(4)
+            if check_mt5_installed():
+                self._log_line("[OK] MetaTrader 5 kuruldu.")
+            else:
+                self._log_line("[!!] Kurulum dogrulanamadi -- devam ediliyor.")
+
+        # Acik degilse ac (config icin)
+        self._log_line("[..] MT5 baslatiliyor (config icin)...")
+        open_mt5()
+        time.sleep(3)
+        self._log_line("[OK] MT5 hazir.")
+
+        self.app.after(800, lambda: self.app.show_page("mt5_config"))
+
+    def _show_error(self):
+        self._phase_var.set("MT5 kurulumu basarisiz — elle kurabilirsiniz.")
+        styled_btn(self._btn_frame, "Tekrar Dene", self.on_show,
+                   color=YELLOW, width=16).pack(side="left", padx=8)
+        styled_btn(self._btn_frame, "Atla", lambda: self.app.show_page("mt5_config"),
+                   color=MUTED, width=14).pack(side="left", padx=8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 4: MT5 Config (Algo Trading + Python API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MT5ConfigPage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._build()
+
+    def _build(self):
+        self._header("⚙️", "MetaTrader 5 Algoritmik Ticaret Ayari",
+                     "Botun MT5 uzerinden islem yapabilmesi icin gerekli")
+
+        tk.Frame(self, bg=BG, height=12).pack()
+
+        # Status rows
+        checks_frame = tk.Frame(self, bg=PANEL, padx=20, pady=16,
+                                highlightbackground=BORDER, highlightthickness=1)
+        checks_frame.pack(padx=32, fill="x", pady=8)
+
+        self._rows: dict[str, dict] = {}
+        checks = [
+            ("algo",   "Algoritmik Ticaret (terminal.ini)"),
+            ("python", "Python API Baglantisi"),
+        ]
+        for key, label_text in checks:
+            row = tk.Frame(checks_frame, bg=PANEL)
+            row.pack(fill="x", pady=4)
+            icon = tk.Label(row, text="⏳", fg=YELLOW, bg=PANEL,
+                            font=tkfont.Font(family="Segoe UI", size=13, weight="bold"))
+            icon.pack(side="left", padx=(0, 10))
+            tk.Label(row, text=label_text, fg=TEXT, bg=PANEL,
+                     font=tkfont.Font(family="Segoe UI", size=10)).pack(side="left")
+            detail = tk.Label(row, text="", fg=MUTED, bg=PANEL,
+                              font=tkfont.Font(family="Segoe UI", size=8))
+            detail.pack(side="right")
+            self._rows[key] = {"icon": icon, "detail": detail}
+
+        # MT5 manual hint
+        hint = tk.Frame(self, bg="#1a1f2e", padx=16, pady=10,
+                        highlightbackground="#2d375e", highlightthickness=1)
+        hint.pack(padx=32, fill="x", pady=8)
+        tk.Label(hint,
+                 text="MT5'te manuel onay: Araclar → Secenekler → Uzman Danismanlar\n"
+                      "→ 'Algoritmik islemlere izin ver' kutusunu isaretleyin → Tamam",
+                 fg="#7ca9ff", bg="#1a1f2e",
+                 font=tkfont.Font(family="Segoe UI", size=9),
+                 justify="left", anchor="w").pack(anchor="w")
+
+        tk.Frame(self, bg=BG, height=10).pack()
+
+        self._phase_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._phase_var, fg=MUTED, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack()
+
+        tk.Frame(self, bg=BG, height=8).pack()
+        self._btn_frame = tk.Frame(self, bg=BG)
+        self._btn_frame.pack()
+
+    def on_show(self):
+        threading.Thread(target=self._do_checks, daemon=True).start()
+
+    def _set_row(self, key: str, ok: bool, detail: str = ""):
+        def _u():
+            row = self._rows[key]
+            row["icon"].config(text="✓" if ok else "✗",
+                               fg=GREEN if ok else RED)
+            row["detail"].config(text=detail)
+        self.app.after(0, _u)
+
+    def _do_checks(self):
+        # Algo trading patching
+        self.app.after(0, lambda: self._phase_var.set("terminal.ini guncelleniyor..."))
+        ok, msg = patch_mt5_algo_trading()
+        self._set_row("algo", ok, msg)
+
+        # Python API check
+        self.app.after(0, lambda: self._phase_var.set("Python API kontrol ediliyor..."))
+        time.sleep(1)
+        ok2, msg2 = verify_mt5_python_api()
+        self._set_row("python", ok2, msg2)
+
+        self.app.after(0, lambda: self._phase_var.set(
+            "Ayarlar tamamlandi. 'Devam Et' butonuna basin." if ok else
+            "Bazi ayarlar basarisiz. MT5'te manuel onay gerekebilir."
+        ))
+        self.app.after(0, self._show_next_btn)
+
+    def _show_next_btn(self):
+        styled_btn(self._btn_frame, "Devam Et →", lambda: self.app.show_page("account"),
+                   color=GREEN, width=20).pack(side="left", padx=8)
+        styled_btn(self._btn_frame, "MT5 Ac", lambda: open_mt5(),
+                   color=ACCENT, width=14).pack(side="left", padx=8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 5: Account Credentials
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AccountPage(BasePage):
+    def __init__(self, master, app, state, on_save_go: str = "complete"):
+        super().__init__(master, app, state)
+        self._on_save_go = on_save_go
+        self._vars: dict[str, tk.StringVar] = {}
+        self._build()
+
+    def _build(self):
+        self._header("🔑", "Hesap Bilgileri",
+                     "Broker hesabinizi tanimlayin — dogru ve guncel tutun")
+
+        # Broker selection
+        brow = self._row(pady=8)
+        tk.Label(brow, text="Broker:", fg=TEXT, bg=BG, width=18, anchor="w",
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left")
+        self._broker_var = tk.StringVar(value=self.state.get("broker", "mt5"))
+        combo = ttk.Combobox(brow, textvariable=self._broker_var,
+                             values=["mt5", "binance", "ib", "mock"],
+                             state="readonly", width=16)
+        combo.pack(side="left")
+        combo.bind("<<ComboboxSelected>>", self._on_broker_change)
+
+        separator(self).pack(fill="x", padx=32, pady=8)
+
+        # MT5 frame
+        self._mt5_frame = tk.Frame(self, bg=BG)
+        self._mt5_frame.pack(fill="x")
+        self._build_mt5_fields(self._mt5_frame)
+
+        # Binance frame
+        self._binance_frame = tk.Frame(self, bg=BG)
+        self._build_binance_fields(self._binance_frame)
+
+        separator(self).pack(fill="x", padx=32, pady=8)
+
+        # Trading params
+        self._build_trading_params()
+
+        tk.Frame(self, bg=BG, height=10).pack()
+
+        btn_f = tk.Frame(self, bg=BG)
+        btn_f.pack()
+        styled_btn(btn_f, "  Kaydet ve Devam  ", self._save,
+                   color=GREEN, width=22).pack(side="left", padx=8)
+
+        self._on_broker_change()
+
+    def _field_row(self, parent, label_text, key, show=None):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", padx=32, pady=3)
+        tk.Label(row, text=label_text, fg=TEXT, bg=BG, width=22, anchor="w",
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left")
+        var = tk.StringVar(value=self.state.get(key, ""))
+        self._vars[key] = var
+        entry(row, var, show=show, width=30).pack(side="left")
+        return var
+
+    def _build_mt5_fields(self, parent):
+        tk.Label(parent, text="MetaTrader 5", fg=ACCENT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=10, weight="bold"),
+                 anchor="w").pack(anchor="w", padx=32, pady=(6, 2))
+        self._field_row(parent, "Hesap Numarasi:", "mt5_account")
+        self._field_row(parent, "Sifre:", "mt5_password", show="*")
+        self._field_row(parent, "Sunucu (Server):", "mt5_server")
+        tk.Label(parent,
+                 text="Sunucu ornek: ICMarkets-Demo, MetaQuotes-Demo, Pepperstone-Demo",
+                 fg=MUTED, bg=BG, font=tkfont.Font(family="Segoe UI", size=8),
+                 anchor="w").pack(anchor="w", padx=32)
+
+    def _build_binance_fields(self, parent):
+        tk.Label(parent, text="Binance", fg=ACCENT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=10, weight="bold"),
+                 anchor="w").pack(anchor="w", padx=32, pady=(6, 2))
+        self._field_row(parent, "API Key:", "binance_key")
+        self._field_row(parent, "API Secret:", "binance_secret", show="*")
+        trow = tk.Frame(parent, bg=BG)
+        trow.pack(fill="x", padx=32, pady=3)
+        self._testnet_var = tk.BooleanVar(value=self.state.get("binance_testnet", True))
+        tk.Checkbutton(trow, text="Testnet kullan (gerçek para kullanilmaz)",
+                       variable=self._testnet_var,
+                       fg=TEXT, bg=BG, selectcolor=INPUT,
+                       activebackground=BG, activeforeground=TEXT,
+                       font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left")
+
+    def _build_trading_params(self):
+        tk.Label(self, text="Islem Parametreleri", fg=ACCENT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=10, weight="bold"),
+                 anchor="w").pack(anchor="w", padx=32, pady=(6, 2))
+        self._field_row(self, "Semboller (boslukla):", "default_symbols")
+        self._field_row(self, "Hesap NAV (USD):", "nav_usd")
+
+        prow = tk.Frame(self, bg=BG)
+        prow.pack(fill="x", padx=32, pady=3)
+        self._paper_var = tk.BooleanVar(value=self.state.get("paper_mode", False))
+        tk.Checkbutton(prow, text="Paper Mode (gercek islem gonderilmez — sadece sinyal logu)",
+                       variable=self._paper_var, fg=TEXT, bg=BG,
+                       selectcolor=INPUT, activebackground=BG, activeforeground=TEXT,
+                       font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left")
+
+    def _on_broker_change(self, *_):
+        broker = self._broker_var.get()
+        for widget in [self._mt5_frame, self._binance_frame]:
+            widget.pack_forget()
+        if broker == "mt5":
+            self._mt5_frame.pack(fill="x")
+        elif broker == "binance":
+            self._binance_frame.pack(fill="x")
+
+    def _save(self):
+        for key, var in self._vars.items():
+            self.state[key] = var.get().strip()
+        self.state["broker"]          = self._broker_var.get()
+        self.state["paper_mode"]      = self._paper_var.get()
+        if hasattr(self, "_testnet_var"):
+            self.state["binance_testnet"] = self._testnet_var.get()
+        # Validate MT5 fields
+        if self.state["broker"] == "mt5":
+            if not self.state.get("mt5_account"):
+                messagebox.showerror("Eksik Bilgi", "MT5 Hesap Numarasi gerekli!")
+                return
+        write_env(self.state)
+        save_state(self.state)
+        self.app.show_page(self._on_save_go)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 6: Setup Complete
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CompletePage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._build()
+
+    def _build(self):
+        tk.Frame(self, bg=BG, height=40).pack()
+        tk.Label(self, text="✓", fg=GREEN, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=64, weight="bold")).pack()
+        tk.Label(self, text="Kurulum Tamamlandi!", fg=TEXT, bg=BG,
+                 font=tkfont.Font(family="Segoe UI", size=18, weight="bold")).pack(pady=8)
+        tk.Label(self,
+                 text="BorsaBot artik bu bilgisayarda calisabilir.\n"
+                      "Bir sonraki acilista kurulum adimları atlaniracak.",
+                 fg=MUTED, bg=BG, font=tkfont.Font(family="Segoe UI", size=9),
+                 justify="center").pack(pady=4)
+
+        tk.Frame(self, bg=BG, height=24).pack()
+        styled_btn(self, "  BorsaBot'u Baslat  ",
+                   self._launch, color=GREEN, width=26).pack()
+        tk.Frame(self, bg=BG, height=8).pack()
+        styled_btn(self, "Grafana Dashboard Ac",
+                   lambda: webbrowser.open("http://localhost:3000"),
+                   color=PANEL, width=22).pack()
+
+    def on_show(self):
+        self.state["setup_complete"] = True
+        save_state(self.state)
+        # Clean temp
+        if TEMP_DIR.exists():
+            try:
+                shutil.rmtree(TEMP_DIR)
             except Exception:
                 pass
 
-    # ── UI Builder ────────────────────────────────────────────────────────────
-    def _build_ui(self):
-        # Fonts
-        title_font  = font.Font(family="Segoe UI", size=18, weight="bold")
-        header_font = font.Font(family="Segoe UI", size=10, weight="bold")
-        body_font   = font.Font(family="Segoe UI", size=9)
-        mono_font   = font.Font(family="Consolas",  size=8)
+    def _launch(self):
+        self.app.go_main()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings Panel (accessible from main launcher)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SettingsPage(AccountPage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state, on_save_go="main")
+        # Override header
+        # Re-use AccountPage but return to main
+
+    def _build(self):
+        self._header("⚙️", "Ayarlar", "Hesap bilgileri ve islem parametreleri")
+        super()._build()
+        # Add back button to btn area
+        # (btn already created in AccountPage._build, add back btn)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Launcher Page
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MainLauncherPage(BasePage):
+    def __init__(self, master, app, state):
+        super().__init__(master, app, state)
+        self._procs: list[subprocess.Popen] = []
+        self._engine_running = False
+        self._dash_running   = False
+        self._build()
+
+    def _build(self):
         # ── Header ────────────────────────────────────────────────────────────
-        hdr = tk.Frame(self, bg=self.PANEL_BG, pady=16)
+        hdr = tk.Frame(self, bg=PANEL, pady=14)
         hdr.pack(fill="x")
-        tk.Label(
-            hdr, text="⚡ BorsaBot", fg=self.ACCENT, bg=self.PANEL_BG,
-            font=title_font
-        ).pack(side="left", padx=20)
-        tk.Label(
-            hdr, text="AI-Native Algorithmic Trading Platform",
-            fg=self.MUTED, bg=self.PANEL_BG, font=body_font
-        ).pack(side="left", padx=6)
+        tk.Label(hdr, text="⚡ BorsaBot", fg=ACCENT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=18, weight="bold")).pack(side="left", padx=18)
+        tk.Label(hdr, text="AI-Native Algorithmic Trading",
+                 fg=MUTED, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left")
 
-        # Version tag
-        tk.Label(
-            hdr, text="v1.0  Production", fg=self.WARNING, bg=self.PANEL_BG,
-            font=body_font
-        ).pack(side="right", padx=20)
+        self._clock_var = tk.StringVar()
+        tk.Label(hdr, textvariable=self._clock_var, fg=MUTED, bg=PANEL,
+                 font=tkfont.Font(family="Consolas", size=8)).pack(side="right", padx=18)
 
-        # Separator
-        tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
+        styled_btn(hdr, "Ayarlar", lambda: self.app.show_page("settings"),
+                   color=PANEL, width=10).pack(side="right", padx=4)
 
-        # ── Status Cards ──────────────────────────────────────────────────────
-        cards_frame = tk.Frame(self, bg=self.DARK_BG, pady=12)
-        cards_frame.pack(fill="x", padx=16)
+        separator(self).pack(fill="x")
 
-        self._status_vars: dict[str, tk.StringVar] = {}
-        self._status_labels: dict[str, tk.Label] = {}
+        # ── Status cards ──────────────────────────────────────────────────────
+        cards_outer = tk.Frame(self, bg=BG, pady=10)
+        cards_outer.pack(fill="x", padx=16)
 
-        statuses = [
-            ("docker",  "🐳 Docker"),
-            ("mt5",     "📊 MetaTrader 5"),
-            ("models",  "🧠 Modeller"),
-            ("env",     "⚙️  .env"),
+        self._card_vars: dict[str, dict] = {}
+        status_items = [
+            ("internet", "🌐 Internet"),
+            ("docker",   "🐳 Docker"),
+            ("mt5",      "📊 MT5"),
+            ("models",   "🧠 Modeller"),
         ]
-
-        for col, (key, label) in enumerate(statuses):
-            card = tk.Frame(cards_frame, bg=self.PANEL_BG, bd=0,
-                            highlightbackground=self.BORDER,
-                            highlightthickness=1, padx=12, pady=8)
+        for col, (key, lbl) in enumerate(status_items):
+            card = tk.Frame(cards_outer, bg=PANEL, padx=12, pady=8,
+                            highlightbackground=BORDER, highlightthickness=1)
             card.grid(row=0, column=col, padx=6, sticky="nsew")
-            cards_frame.columnconfigure(col, weight=1)
+            cards_outer.columnconfigure(col, weight=1)
+            tk.Label(card, text=lbl, fg=MUTED, bg=PANEL,
+                     font=tkfont.Font(family="Segoe UI", size=9, weight="bold")).pack(anchor="w")
+            icon  = tk.Label(card, text="⏳", fg=YELLOW, bg=PANEL,
+                             font=tkfont.Font(family="Segoe UI", size=14, weight="bold"))
+            icon.pack(anchor="w")
+            detail = tk.Label(card, text="", fg=MUTED, bg=PANEL,
+                              font=tkfont.Font(family="Segoe UI", size=8))
+            detail.pack(anchor="w")
+            self._card_vars[key] = {"icon": icon, "detail": detail}
 
-            tk.Label(card, text=label, fg=self.MUTED, bg=self.PANEL_BG,
-                     font=header_font).pack(anchor="w")
-            var = tk.StringVar(value="Kontrol ediliyor...")
-            lbl = tk.Label(card, textvariable=var, fg=self.WARNING,
-                           bg=self.PANEL_BG, font=body_font)
-            lbl.pack(anchor="w", pady=(2, 0))
-            self._status_vars[key]  = var
-            self._status_labels[key] = lbl
+        # ── Config row ────────────────────────────────────────────────────────
+        cfg = tk.Frame(self, bg=PANEL, padx=16, pady=10,
+                       highlightbackground=BORDER, highlightthickness=1)
+        cfg.pack(fill="x", padx=16, pady=6)
 
-        # ── Config Section ────────────────────────────────────────────────────
-        cfg_frame = tk.LabelFrame(self, text=" Başlatma Konfigürasyonu ",
-                                  fg=self.ACCENT, bg=self.DARK_BG,
-                                  font=header_font, bd=1,
-                                  highlightbackground=self.BORDER)
-        cfg_frame.pack(fill="x", padx=16, pady=8)
+        r1 = tk.Frame(cfg, bg=PANEL)
+        r1.pack(fill="x")
+        tk.Label(r1, text="Broker:", fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9), width=11, anchor="w").pack(side="left")
+        self._broker_var = tk.StringVar(value=self.state.get("broker", "mt5"))
+        ttk.Combobox(r1, textvariable=self._broker_var,
+                     values=["mt5", "binance", "ib", "mock"],
+                     state="readonly", width=12).pack(side="left", padx=4)
 
-        # Broker seçimi
-        row1 = tk.Frame(cfg_frame, bg=self.DARK_BG)
-        row1.pack(fill="x", padx=12, pady=6)
-        tk.Label(row1, text="Broker:", fg=self.TEXT, bg=self.DARK_BG,
-                 font=body_font, width=14, anchor="w").pack(side="left")
-        self._broker_var = tk.StringVar(value="mt5")
-        broker_combo = ttk.Combobox(
-            row1, textvariable=self._broker_var,
-            values=["mt5", "binance", "ib", "mock"],
-            state="readonly", width=16
-        )
-        broker_combo.pack(side="left", padx=4)
+        tk.Label(r1, text="Semboller:", fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9), width=12, anchor="w").pack(side="left", padx=(12, 0))
+        self._symbols_var = tk.StringVar(value=self.state.get("default_symbols", "EURUSD"))
+        tk.Entry(r1, textvariable=self._symbols_var, bg=INPUT, fg=TEXT,
+                 insertbackground=TEXT, relief="flat", width=20,
+                 font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left", padx=4)
 
-        # Paper mode
-        self._paper_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            row1, text="Paper Mode (Gerçek işlem yok)",
-            variable=self._paper_var, fg=self.TEXT, bg=self.DARK_BG,
-            selectcolor=self.PANEL_BG, activebackground=self.DARK_BG,
-            activeforeground=self.TEXT, font=body_font
-        ).pack(side="left", padx=16)
+        r2 = tk.Frame(cfg, bg=PANEL)
+        r2.pack(fill="x", pady=(6, 0))
+        tk.Label(r2, text="Preset:", fg=TEXT, bg=PANEL,
+                 font=tkfont.Font(family="Segoe UI", size=9), width=11, anchor="w").pack(side="left")
+        self._preset_var = tk.StringVar(value=self.state.get("preset", "ana"))
+        ttk.Combobox(r2, textvariable=self._preset_var,
+                     values=["ana", "test", "ozel"],
+                     state="readonly", width=12).pack(side="left", padx=4)
 
-        # Semboller
-        row2 = tk.Frame(cfg_frame, bg=self.DARK_BG)
-        row2.pack(fill="x", padx=12, pady=4)
-        tk.Label(row2, text="Semboller:", fg=self.TEXT, bg=self.DARK_BG,
-                 font=body_font, width=14, anchor="w").pack(side="left")
-        self._symbols_var = tk.StringVar(
-            value=os.environ.get("DEFAULT_SYMBOLS", "EURUSD XAUUSD")
-        )
-        tk.Entry(row2, textvariable=self._symbols_var,
-                 bg=self.PANEL_BG, fg=self.TEXT,
-                 insertbackground=self.TEXT, width=30,
-                 font=mono_font).pack(side="left", padx=4)
+        self._paper_var = tk.BooleanVar(value=self.state.get("paper_mode", False))
+        tk.Checkbutton(r2, text="Paper Mode", variable=self._paper_var,
+                       fg=TEXT, bg=PANEL, selectcolor=INPUT,
+                       activebackground=PANEL, activeforeground=TEXT,
+                       font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left", padx=12)
 
-        # NAV
-        row3 = tk.Frame(cfg_frame, bg=self.DARK_BG)
-        row3.pack(fill="x", padx=12, pady=4)
-        tk.Label(row3, text="NAV (USD):", fg=self.TEXT, bg=self.DARK_BG,
-                 font=body_font, width=14, anchor="w").pack(side="left")
-        self._nav_var = tk.StringVar(
-            value=os.environ.get("NAV_USD", "100000")
-        )
-        tk.Entry(row3, textvariable=self._nav_var,
-                 bg=self.PANEL_BG, fg=self.TEXT,
-                 insertbackground=self.TEXT, width=12,
-                 font=mono_font).pack(side="left", padx=4)
+        self._docker_auto_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(r2, text="Docker otomatik baslat",
+                       variable=self._docker_auto_var,
+                       fg=TEXT, bg=PANEL, selectcolor=INPUT,
+                       activebackground=PANEL, activeforeground=TEXT,
+                       font=tkfont.Font(family="Segoe UI", size=9)).pack(side="left", padx=4)
 
-        # Docker servis başlatma
-        self._docker_start_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            row3, text="Docker servislerini otomatik başlat",
-            variable=self._docker_start_var,
-            fg=self.TEXT, bg=self.DARK_BG,
-            selectcolor=self.PANEL_BG,
-            activebackground=self.DARK_BG,
-            activeforeground=self.TEXT, font=body_font
-        ).pack(side="left", padx=16)
-
-        # ── Ruleset ───────────────────────────────────────────────────────────
-        rule_frame = tk.LabelFrame(self, text=" Trade Ruleset ",
-                                   fg=self.ACCENT, bg=self.DARK_BG,
-                                   font=header_font, bd=1)
-        rule_frame.pack(fill="x", padx=16, pady=4)
-
-        row_r = tk.Frame(rule_frame, bg=self.DARK_BG)
-        row_r.pack(fill="x", padx=12, pady=6)
-        tk.Label(row_r, text="Preset:", fg=self.TEXT, bg=self.DARK_BG,
-                 font=body_font, width=14, anchor="w").pack(side="left")
-        self._preset_var = tk.StringVar(value="ana")
-        preset_combo = ttk.Combobox(
-            row_r, textvariable=self._preset_var,
-            values=["ana", "test", "ozel"],
-            state="readonly", width=10
-        )
-        preset_combo.pack(side="left", padx=4)
-        preset_combo.bind("<<ComboboxSelected>>", self._on_preset_change)
-
-        tk.Label(row_r, text="Ana = Üretim filtreli  |  Test = Agresif (kısıtsız)  |  Özel = Manuel",
-                 fg=self.MUTED, bg=self.DARK_BG, font=body_font
-                 ).pack(side="left", padx=10)
-
-        # ── Action Buttons ────────────────────────────────────────────────────
-        btn_frame = tk.Frame(self, bg=self.DARK_BG, pady=10)
+        # ── Action buttons ────────────────────────────────────────────────────
+        btn_frame = tk.Frame(self, bg=BG, pady=10)
         btn_frame.pack(fill="x", padx=16)
 
-        btn_style = dict(
-            font=font.Font(family="Segoe UI", size=10, weight="bold"),
-            relief="flat", cursor="hand2", padx=16, pady=8, bd=0
+        self._start_all_btn = styled_btn(
+            btn_frame, "  ⚡  Her Seyi Baslat  ", self._start_all,
+            color=GREEN, width=24
         )
+        self._start_all_btn.pack(side="left", padx=4)
 
-        self._engine_btn = tk.Button(
-            btn_frame, text="▶  Engine Başlat",
-            bg=self.SUCCESS, fg="white",
-            command=self._start_engine, **btn_style
+        self._engine_btn = styled_btn(
+            btn_frame, "▶  Engine", self._start_engine,
+            color="#1f5c2e", width=14
         )
         self._engine_btn.pack(side="left", padx=4)
 
-        self._dash_btn = tk.Button(
-            btn_frame, text="📊  Dashboard Aç",
-            bg=self.ACCENT, fg="white",
-            command=self._start_dashboard, **btn_style
+        self._dash_btn = styled_btn(
+            btn_frame, "📊  Dashboard", self._start_dashboard,
+            color="#1a3f6f", width=16
         )
         self._dash_btn.pack(side="left", padx=4)
 
-        self._both_btn = tk.Button(
-            btn_frame, text="⚡  İkisini Birden Başlat",
-            bg="#6e40c9", fg="white",
-            command=self._start_both, **btn_style
-        )
-        self._both_btn.pack(side="left", padx=4)
-
-        tk.Button(
-            btn_frame, text="🛑  Durdur",
-            bg=self.ERROR, fg="white",
-            command=self._stop_all, **btn_style
+        styled_btn(
+            btn_frame, "🛑  Durdur", self._stop_all,
+            color="#5c1f1f", width=12
         ).pack(side="right", padx=4)
 
-        tk.Button(
-            btn_frame, text="🔄  Yenile",
-            bg=self.PANEL_BG, fg=self.TEXT,
-            command=self._initial_check, **btn_style
+        styled_btn(
+            btn_frame, "🔄  Yenile", self._run_health_check,
+            color=PANEL, width=10
         ).pack(side="right", padx=4)
 
-        # ── Log Frame ─────────────────────────────────────────────────────────
-        log_frame = tk.LabelFrame(
-            self, text=" Launcher Log ", fg=self.ACCENT,
-            bg=self.DARK_BG, font=header_font, bd=1
+        styled_btn(
+            btn_frame, "Grafana", lambda: webbrowser.open("http://localhost:3000"),
+            color=PANEL, width=10
+        ).pack(side="right", padx=4)
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        log_lf = tk.LabelFrame(self, text=" Log ", fg=ACCENT, bg=BG,
+                               font=tkfont.Font(family="Segoe UI", size=9, weight="bold"), bd=1)
+        log_lf.pack(fill="both", expand=True, padx=16, pady=6)
+
+        self._log = tk.Text(
+            log_lf, bg="#0a0e14", fg=TEXT, state="disabled",
+            font=tkfont.Font(family="Consolas", size=8),
+            height=8, wrap="word", bd=0
         )
-        log_frame.pack(fill="both", expand=True, padx=16, pady=8)
+        sb = ttk.Scrollbar(log_lf, command=self._log.yview)
+        self._log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._log.pack(fill="both", expand=True, padx=4, pady=4)
 
-        self._log_text = tk.Text(
-            log_frame, bg="#0a0e14", fg=self.TEXT,
-            font=mono_font, height=10, state="disabled",
-            wrap="word", bd=0, relief="flat"
-        )
-        scrollbar = ttk.Scrollbar(log_frame, command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        self._log_text.pack(fill="both", expand=True, padx=4, pady=4)
+        for tag, color in [("ok", GREEN), ("err", RED), ("warn", YELLOW),
+                            ("info", TEXT), ("muted", MUTED)]:
+            self._log.tag_configure(tag, foreground=color)
 
-        # Tag renkler
-        self._log_text.tag_configure("ok",   foreground=self.SUCCESS)
-        self._log_text.tag_configure("err",  foreground=self.ERROR)
-        self._log_text.tag_configure("warn", foreground=self.WARNING)
-        self._log_text.tag_configure("info", foreground=self.TEXT)
-        self._log_text.tag_configure("muted", foreground=self.MUTED)
+        # Status bar
+        self._statusbar_var = tk.StringVar(value="Hazir")
+        tk.Label(self, textvariable=self._statusbar_var, fg=MUTED,
+                 bg=PANEL, anchor="w", pady=3).pack(fill="x", side="bottom")
 
-        # ── Status Bar ────────────────────────────────────────────────────────
-        self._statusbar_var = tk.StringVar(value="Hazır")
-        tk.Label(
-            self, textvariable=self._statusbar_var,
-            fg=self.MUTED, bg=self.PANEL_BG, anchor="w", pady=4
-        ).pack(fill="x", side="bottom")
+    def on_show(self):
+        # Saat timerini sadece ilk acilista baslat
+        if not getattr(self, "_clock_started", False):
+            self._clock_started = True
+            self._tick_clock()
+        self._run_health_check()
+        # MT5/Docker yavas baslarsa 6 saniye sonra tekrar kontrol et
+        if not getattr(self, "_auto_recheck_done", False):
+            self._auto_recheck_done = True
+            self.app.after(6000, self._run_health_check)
 
-    # ── Logging ───────────────────────────────────────────────────────────────
-    def _log(self, msg: str, tag: str = "info"):
+    # ── Clock ──────────────────────────────────────────────────────────────────
+    def _tick_clock(self):
+        self._clock_var.set(time.strftime("%H:%M:%S  %Y-%m-%d"))
+        self.app.after(1000, self._tick_clock)
+
+    # ── Log ────────────────────────────────────────────────────────────────────
+    def _log_line(self, msg: str, tag: str = "info"):
         ts = time.strftime("%H:%M:%S")
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", f"[{ts}] {msg}\n", tag)
-        self._log_text.see("end")
-        self._log_text.configure(state="disabled")
+        def _u():
+            self._log.configure(state="normal")
+            self._log.insert("end", f"[{ts}] {msg}\n", tag)
+            self._log.see("end")
+            self._log.configure(state="disabled")
+        self.app.after(0, _u)
 
-    def _set_status(self, key: str, text: str, color: str):
-        self._status_vars[key].set(text)
-        self._status_labels[key].configure(fg=color)
+    def _set_card(self, key: str, ok: bool | None, detail: str = ""):
+        def _u():
+            row = self._card_vars[key]
+            if ok is None:
+                row["icon"].config(text="⏳", fg=YELLOW)
+            elif ok:
+                row["icon"].config(text="✓", fg=GREEN)
+            else:
+                row["icon"].config(text="✗", fg=RED)
+            row["detail"].config(text=detail)
+        self.app.after(0, _u)
 
-    # ── Checks ────────────────────────────────────────────────────────────────
-    def _initial_check(self):
-        threading.Thread(target=self._run_checks, daemon=True).start()
+    # ── Health Check ────────────────────────────────────────────────────────────
+    def _run_health_check(self):
+        self._log_line("Sistem kontrolu baslatiliyor...", "muted")
+        threading.Thread(target=self._do_health_check, daemon=True).start()
 
-    def _run_checks(self):
-        self._log("Sistem kontrolleri başlatılıyor...", "muted")
+    def _do_health_check(self):
+        # Internet
+        ok = check_internet()
+        self._set_card("internet", ok, "Aktif" if ok else "Baglanti yok")
+        if ok:
+            self._log_line("Internet: Aktif", "ok")
+        else:
+            self._log_line("Internet: Baglanti yok", "warn")
 
         # Docker
-        if _check_docker():
-            self.after(0, lambda: self._set_status("docker", "✅ Çalışıyor", self.SUCCESS))
-            self._log("Docker: Çalışıyor", "ok")
+        d_installed = check_docker_installed()
+        d_running   = check_docker_running() if d_installed else False
+        if d_running:
+            self._set_card("docker", True, "Calisuyor")
+            self._log_line("Docker: Calisuyor", "ok")
+        elif d_installed:
+            self._set_card("docker", False, "Yuklü fakat kapali")
+            self._log_line("Docker: Yuklu fakat kapali — otomatik baslatiliyor...", "warn")
+            if self._docker_auto_var.get():
+                threading.Thread(target=self._auto_start_docker, daemon=True).start()
         else:
-            self.after(0, lambda: self._set_status("docker", "❌ Kapalı", self.ERROR))
-            self._log("Docker: Kapalı — Docker Desktop'ı başlatın", "warn")
+            self._set_card("docker", False, "Kurulu degil")
+            self._log_line("Docker: Kurulu degil — kurulum sihirbazini calistirin", "err")
 
-        # MT5
-        if _check_mt5_running():
-            self.after(0, lambda: self._set_status("mt5", "✅ Çalışıyor", self.SUCCESS))
-            self._log("MetaTrader 5: Çalışıyor", "ok")
+        # MT5 — process check FIRST (works even if installed at non-standard path)
+        mt5_running   = check_mt5_running()
+        mt5_installed = mt5_running or check_mt5_installed()
+        if mt5_running:
+            self._set_card("mt5", True, "Calisuyor")
+            self._log_line("MetaTrader 5: Calisuyor", "ok")
+        elif mt5_installed:
+            self._set_card("mt5", False, "Yuklu fakat kapali")
+            self._log_line("MetaTrader 5: Yuklu fakat kapali — aciliyor...", "warn")
+            threading.Thread(target=lambda: open_mt5(), daemon=True).start()
         else:
-            self.after(0, lambda: self._set_status("mt5", "⚠️  Kapalı", self.WARNING))
-            self._log("MetaTrader 5: Kapalı — Engine başlatmadan önce açın", "warn")
+            self._set_card("mt5", False, "Kurulu degil")
+            self._log_line("MetaTrader 5: Kurulu degil — kurulum sihirbazini calistirin", "err")
 
-        # Modeller
+        # Models
         pkls = list(MODEL_DIR.glob("*.pkl")) if MODEL_DIR.exists() else []
-        if pkls:
-            self.after(0, lambda: self._set_status("models", f"✅ {len(pkls)} dosya", self.SUCCESS))
-            self._log(f"Modeller: {len(pkls)} .pkl dosyası bulundu", "ok")
+        ok = len(pkls) > 0
+        self._set_card("models", ok, f"{len(pkls)} pkl" if ok else "Bulunamadi")
+        if ok:
+            self._log_line(f"Modeller: {len(pkls)} dosya hazir", "ok")
         else:
-            self.after(0, lambda: self._set_status("models", "❌ Bulunamadı", self.ERROR))
-            self._log(f"Modeller: models/ klasörü boş veya yok ({MODEL_DIR})", "err")
+            self._log_line("Modeller: models/ klasorunde .pkl bulunamadi", "err")
 
-        # .env
-        if _env_path.exists():
-            self.after(0, lambda: self._set_status("env", "✅ Yüklendi", self.SUCCESS))
-            self._log(f".env: Yüklendi ({_env_path})", "ok")
+        self.app.after(0, lambda: self._statusbar_var.set(
+            f"Kontrol tamamlandi — {time.strftime('%H:%M:%S')}"
+        ))
+
+    def _auto_start_docker(self):
+        self._log_line("Docker Desktop baslatiliyor (daemon bekleniyor)...", "info")
+        ok = start_docker_desktop(lambda m: self._log_line(m, "muted"))
+        if ok:
+            self._log_line("Docker hazir!", "ok")
+            self._set_card("docker", True, "Calisuyor")
+            ok2 = start_docker_services(lambda m: self._log_line(m, "muted"))
+            if ok2:
+                self._log_line("Docker servisleri baslatildi.", "ok")
         else:
-            self.after(0, lambda: self._set_status("env", "❌ Bulunamadı", self.ERROR))
-            self._log(f".env bulunamadı — {_env_path} oluşturun", "err")
+            self._log_line("Docker daemon baslamadi — yonetici olarak calistirdiginizdan emin olun.", "err")
+            self._set_card("docker", False, "Baslamiyor")
 
-        self.after(0, lambda: self._statusbar_var.set("Kontrol tamamlandı"))
+    # ── Launch helpers ─────────────────────────────────────────────────────────
+    def _get_symbols(self) -> list[str]:
+        return self._symbols_var.get().strip().split() or ["EURUSD"]
 
-    # ── Preset ───────────────────────────────────────────────────────────────
-    def _on_preset_change(self, event=None):
-        preset = self._preset_var.get()
-        desc = {
-            "ana":   "Üretim preset — yüksek güven filtreli, düşük risk",
-            "test":  "Agresif preset — tüm filtreler kapalı, hızlı giriş",
-            "ozel":  "Özel — engine başladığında interaktif menüden ayar",
-        }
-        self._log(f"Preset seçildi: {preset} — {desc.get(preset,'')}", "info")
+    def _get_nav(self) -> str:
+        return self.state.get("nav_usd", "3000")
 
-    # ── Start Engine ─────────────────────────────────────────────────────────
+    def _start_all(self):
+        self._start_engine()
+        self.app.after(5000, self._start_dashboard)
+
     def _start_engine(self):
         if self._engine_running:
-            self._log("Engine zaten çalışıyor!", "warn")
+            self._log_line("Engine zaten calisuyor!", "warn")
             return
-
         broker  = self._broker_var.get()
-        symbols = self._symbols_var.get().strip().split()
-        nav     = self._nav_var.get().strip()
+        symbols = self._get_symbols()
+        nav     = self._get_nav()
         paper   = self._paper_var.get()
         preset  = self._preset_var.get()
+        self._log_line(f"Engine baslatiliyor — broker={broker} symbols={' '.join(symbols)}", "info")
 
-        if not symbols:
-            messagebox.showerror("Hata", "En az bir sembol girin!")
-            return
-
-        self._statusbar_var.set("Engine başlatılıyor...")
-        self._log(f"Engine başlatılıyor — broker={broker} symbols={symbols} paper={paper}", "info")
-
-        # Docker servislerini başlat (arka planda)
-        if self._docker_start_var.get():
-            self._log("Docker servisleri kontrol ediliyor/başlatılıyor...", "muted")
-            threading.Thread(
-                target=lambda: _docker_services_up(BASE_DIR), daemon=True
-            ).start()
-
-        threading.Thread(
-            target=self._launch_engine,
-            args=(broker, symbols, nav, paper, preset),
-            daemon=True
-        ).start()
-
-    def _launch_engine(self, broker, symbols, nav, paper, preset):
-        py_exe = _get_python_exe()
-        script = SCRIPTS_DIR / "main.py"
-
-        cmd = [py_exe, str(script),
-               "--broker", broker,
-               "--symbols", *symbols,
-               "--model-dir", str(MODEL_DIR),
-               "--nav", nav]
-        if paper:
-            cmd.append("--paper")
-
-        # Preset otomatik seçimi için env var kullan
         env = os.environ.copy()
         env["BORSABOT_PRESET"] = preset
 
+        py = self._get_python()
+        script_args = [
+            "--broker", broker,
+            "--symbols", *symbols,
+            "--model-dir", str(MODEL_DIR),
+            "--nav", nav,
+        ]
+        if paper:
+            script_args.append("--paper")
+
+        if py == "__frozen__":
+            # Frozen EXE: kendini --run-engine moduyla calistir
+            cmd = [sys.executable, "--run-engine"] + script_args
+        else:
+            cmd = [py, str(SCRIPTS_DIR / "main.py")] + script_args
+
+        threading.Thread(target=lambda: self._launch_proc(
+            cmd, env, "engine"
+        ), daemon=True).start()
+
+    def _start_dashboard(self):
+        if self._dash_running:
+            self._log_line("Dashboard zaten calisuyor!", "warn")
+            return
+        broker  = self._broker_var.get()
+        symbols = self._get_symbols()
+        self._log_line("Dashboard aciliyor...", "info")
+        py = self._get_python()
+        script_args = [
+            "--broker", broker,
+            "--symbols", *symbols,
+            "--model-dir", str(MODEL_DIR),
+        ]
+        if py == "__frozen__":
+            cmd = [sys.executable, "--run-dashboard"] + script_args
+        else:
+            cmd = [py, str(SCRIPTS_DIR / "dashboard.py")] + script_args
+        threading.Thread(target=lambda: self._launch_proc(
+            cmd, os.environ.copy(), "dashboard"
+        ), daemon=True).start()
+
+    def _launch_proc(self, cmd: list, env: dict, kind: str):
         try:
             proc = subprocess.Popen(
                 cmd, cwd=str(BASE_DIR), env=env,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
             self._procs.append(proc)
-            self._engine_running = True
-            self.after(0, lambda: self._log(f"Engine başlatıldı (PID={proc.pid})", "ok"))
-            self.after(0, lambda: self._statusbar_var.set(f"Engine çalışıyor (PID={proc.pid})"))
-            self.after(0, lambda: self._engine_btn.configure(bg="#2d6a2d"))
+            if kind == "engine":
+                self._engine_running = True
+                self.app.after(0, lambda: (
+                    self._engine_btn.configure(bg="#145c1e"),
+                    self._log_line(f"Engine baslatildi (PID={proc.pid})", "ok"),
+                    self._statusbar_var.set(f"Engine calisuyor — PID {proc.pid}"),
+                ))
+            else:
+                self._dash_running = True
+                self.app.after(0, lambda: (
+                    self._dash_btn.configure(bg="#0e2d4f"),
+                    self._log_line(f"Dashboard acildi (PID={proc.pid})", "ok"),
+                ))
         except Exception as e:
-            self.after(0, lambda: self._log(f"Engine başlatma HATASI: {e}", "err"))
-            self._engine_running = False
+            self.app.after(0, lambda: self._log_line(f"HATA ({kind}): {e}", "err"))
+            if kind == "engine":
+                self._engine_running = False
+            else:
+                self._dash_running = False
 
-    # ── Start Dashboard ───────────────────────────────────────────────────────
-    def _start_dashboard(self):
-        if self._dash_running:
-            self._log("Dashboard zaten çalışıyor!", "warn")
-            return
-
-        broker  = self._broker_var.get()
-        symbols = self._symbols_var.get().strip().split()
-
-        self._log(f"Dashboard açılıyor — broker={broker} symbols={symbols}", "info")
-        threading.Thread(
-            target=self._launch_dashboard,
-            args=(broker, symbols),
-            daemon=True
-        ).start()
-
-    def _launch_dashboard(self, broker, symbols):
-        py_exe  = _get_python_exe()
-        script  = SCRIPTS_DIR / "dashboard.py"
-
-        cmd = [py_exe, str(script),
-               "--broker", broker,
-               "--symbols", *symbols,
-               "--model-dir", str(MODEL_DIR)]
-
-        try:
-            proc = subprocess.Popen(
-                cmd, cwd=str(BASE_DIR),
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
-            self._procs.append(proc)
-            self._dash_running = True
-            self.after(0, lambda: self._log(f"Dashboard açıldı (PID={proc.pid})", "ok"))
-            self.after(0, lambda: self._dash_btn.configure(bg="#1a4a7a"))
-        except Exception as e:
-            self.after(0, lambda: self._log(f"Dashboard HATASI: {e}", "err"))
-            self._dash_running = False
-
-    # ── Start Both ────────────────────────────────────────────────────────────
-    def _start_both(self):
-        self._start_engine()
-        # Dashboard'u engine 4 saniye sonra başlasın
-        self.after(4000, self._start_dashboard)
-
-    # ── Stop All ──────────────────────────────────────────────────────────────
     def _stop_all(self):
-        if not self._procs:
-            self._log("Çalışan proses yok.", "warn")
-            return
         for proc in self._procs:
             try:
                 proc.terminate()
-                self._log(f"PID {proc.pid} durduruldu", "warn")
+                self._log_line(f"PID {proc.pid} durduruldu", "warn")
             except Exception:
                 pass
         self._procs.clear()
         self._engine_running = False
         self._dash_running   = False
-        self._engine_btn.configure(bg=self.SUCCESS)
-        self._dash_btn.configure(bg=self.ACCENT)
-        self._statusbar_var.set("Tüm prosesler durduruldu")
+        self._engine_btn.configure(bg="#1f5c2e")
+        self._dash_btn.configure(bg="#1a3f6f")
+        self._statusbar_var.set("Tum prosesler durduruldu")
 
-    # ── Close ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _get_python() -> str:
+        """Calistirilabilir Python yolunu bul.
+        Frozen EXE modunda sys.executable = BorsaBot.exe, script calistiramaz.
+        Bu yuzden sistem Python'unu veya PATH'teki python'u buluyoruz.
+        """
+        if getattr(sys, "frozen", False):
+            # 1. PyInstaller _internal/ icinde python.exe var mi?
+            internal = Path(sys.executable).parent / "_internal" / "python.exe"
+            if internal.exists():
+                return str(internal)
+            # 2. PATH'te python / py var mi?
+            for name in ("python", "python3", "py"):
+                found = shutil.which(name)
+                if found and "BorsaBot" not in found:  # kendi EXE'yi secme
+                    return found
+            # 3. Bilinen kurulum konumlari
+            local_app = os.environ.get("LOCALAPPDATA", "")
+            for candidate in [
+                Path(local_app) / "Programs" / "Python" / "Python312" / "python.exe",
+                Path(local_app) / "Programs" / "Python" / "Python311" / "python.exe",
+                Path(local_app) / "Programs" / "Python" / "Python310" / "python.exe",
+                Path("C:/Python312/python.exe"),
+                Path("C:/Python311/python.exe"),
+                Path("C:/Python310/python.exe"),
+            ]:
+                if candidate.exists():
+                    return str(candidate)
+            # 4. Son care: EXE'yi --run-engine moduyla calistir
+            return "__frozen__"
+        venv_py = BASE_DIR / "venv" / "Scripts" / "python.exe"
+        return str(venv_py) if venv_py.exists() else sys.executable
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App Orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BorsaBotApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("BorsaBot — Production Launcher v2.0")
+        self.geometry("780x680")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self._apply_style()
+
+        self.state = load_state()
+        self._pages: dict[str, BasePage] = {}
+        self._current: str | None = None
+
+        self._init_pages()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Decide starting page
+        if self.state.get("setup_complete"):
+            self.show_page("main")
+        else:
+            self.show_page("welcome")
+
+    def _apply_style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TCombobox",
+                        fieldbackground=INPUT, background=INPUT,
+                        foreground=TEXT, selectbackground=ACCENT,
+                        bordercolor=BORDER, darkcolor=PANEL, lightcolor=PANEL)
+        style.configure("Horizontal.TProgressbar",
+                        troughcolor=PANEL, background=ACCENT, bordercolor=BORDER)
+        style.configure("TScrollbar",
+                        background=PANEL, troughcolor=BG, bordercolor=BORDER,
+                        arrowcolor=MUTED)
+
+    def _init_pages(self):
+        container = tk.Frame(self, bg=BG)
+        container.pack(fill="both", expand=True)
+        self._container = container
+
+        page_classes = {
+            "welcome":       WelcomePage,
+            "internet":      InternetPage,
+            "docker_install": DockerInstallPage,
+            "mt5_install":   MT5InstallPage,
+            "mt5_config":    MT5ConfigPage,
+            "account":       AccountPage,
+            "complete":      CompletePage,
+            "settings":      SettingsPage,
+            "main":          MainLauncherPage,
+        }
+
+        for name, cls in page_classes.items():
+            page = cls(container, self, self.state)
+            page.place(relwidth=1, relheight=1)
+            self._pages[name] = page
+
+    def show_page(self, name: str):
+        if name not in self._pages:
+            return
+        for page in self._pages.values():
+            page.lower()
+        page = self._pages[name]
+        page.lift()
+        self._current = name
+        page.on_show()
+
+    def go_main(self):
+        self.show_page("main")
+
     def _on_close(self):
-        if self._procs:
-            if messagebox.askyesno(
-                "Çıkış",
-                "Çalışan Engine/Dashboard prosesleri var.\n"
-                "Bunları da durdurmak istiyor musunuz?"
-            ):
-                self._stop_all()
+        main_page = self._pages.get("main")
+        if main_page and isinstance(main_page, MainLauncherPage) and main_page._procs:
+            if messagebox.askyesno("Cikis",
+                                   "Calisana Engine/Dashboard prosesleri var.\n"
+                                   "Bunlari da durdurmak istiyor musunuz?"):
+                main_page._stop_all()
         self.destroy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point
+# Entry
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    app = BorsaBotLauncher()
+    LOG_DIR.mkdir(exist_ok=True)
+
+    # ── Frozen EXE alt-proses modlari ────────────────────────────────────────
+    # BorsaBot.exe --run-engine  --> engine'i calistir (yeni konsol penceresi)
+    # BorsaBot.exe --run-dashboard --> dashboard'u calistir
+    args = sys.argv[1:]
+    if args and args[0] == "--run-engine":
+        _run_script_mode(SCRIPTS_DIR / "main.py", args[1:])
+        return
+    if args and args[0] == "--run-dashboard":
+        _run_script_mode(SCRIPTS_DIR / "dashboard.py", args[1:])
+        return
+
+    app = BorsaBotApp()
     app.mainloop()
+
+
+def _run_script_mode(script: Path, extra_args: list):
+    """Frozen EXE icinde bir Python scriptini calistir.
+    CREATE_NEW_CONSOLE ile acilan pencerede stdio'yu duzelterek calistir.
+    """
+    # 1. Konsol tahsis et (EXE konsолсуз baslatildiysa)
+    try:
+        import ctypes
+        ctypes.windll.kernel32.AllocConsole()
+    except Exception:
+        pass
+
+    # 2. sys.stdout / stderr / stdin None ise konsola bagla
+    def _fix_stream(attr: str, mode: str, con: str, fallback: str):
+        try:
+            if getattr(sys, attr) is None:
+                setattr(sys, attr, open(con, mode, encoding="utf-8", errors="replace"))
+        except Exception:
+            try:
+                setattr(sys, attr, open(fallback, mode))
+            except Exception:
+                pass
+
+    _fix_stream("stdout", "w",  "CONOUT$", "nul")
+    _fix_stream("stderr", "w",  "CONOUT$", "nul")
+    _fix_stream("stdin",  "r",  "CONIN$",  "nul")
+
+    # io.TextIOWrapper icin buffer kontrolu (dashboard.py gibi scriptler)
+    for attr in ("stdout", "stderr"):
+        stream = getattr(sys, attr, None)
+        if stream is not None and not hasattr(stream, "buffer"):
+            import io as _io
+            try:
+                raw = getattr(stream, "raw", None) or stream
+                setattr(sys, attr, _io.TextIOWrapper(
+                    _io.FileIO(stream.fileno(), mode="w"),
+                    encoding="utf-8", errors="replace", line_buffering=True
+                ))
+            except Exception:
+                pass
+
+    # 3. Script'i calistir
+    import importlib.util
+    sys.argv = [str(script)] + extra_args
+
+    project_root = str(BASE_DIR)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    spec = importlib.util.spec_from_file_location("__main__", str(script))
+    if spec is None or spec.loader is None:
+        print(f"[HATA] Script yuklenemedi: {script}")
+        input("Devam etmek icin Enter'a basin...")
+        sys.exit(1)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["__main__"] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit:
+        pass
+    except Exception:
+        import traceback
+        print(f"\n[HATA] Script hatasi:\n{traceback.format_exc()}")
+        input("\nDevam etmek icin Enter'a basin...")
 
 
 if __name__ == "__main__":
