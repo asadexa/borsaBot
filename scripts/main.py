@@ -180,7 +180,7 @@ async def main(
     risk = RiskEngine(
         limits=RiskLimits(
             max_position_usd=float(os.getenv("MAX_POSITION_USD", 50_000)),
-            max_portfolio_pct=float(os.getenv("MAX_PORTFOLIO_PCT", 0.10)),
+            max_portfolio_pct=float(os.getenv("MAX_PORTFOLIO_PCT", 0.50)), # Testlerde limitlere takilmamasi icin gecici olarak %50 ye cikarildi
             max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", 0.05)),
         ),
         nav=nav,

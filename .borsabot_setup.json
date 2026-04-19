@@ -1,4 +1,4 @@
-﻿{
+{
     "mt5_password":  "ZgWr*3Km",
     "paper_mode":  false,
     "mt5_account":  "104707121",
@@ -9,7 +9,7 @@
     "mt5_server":  "MetaQuotes-Demo",
     "broker":  "mt5",
     "setup_complete":  true,
-    "preset":  "ana",
+    "preset":  "test",
     "binance_secret":  "eogx2lyoF1EaSR1MWTBzCjWqVhvhgdyigePQkGKIWo0Ja1EKnKD4ychyzoKM1Q5o",
     "setup_version":  "2.0"
 }

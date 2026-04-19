@@ -276,12 +276,9 @@ def build_dashboard(mt5: MT5Live, symbols: list[str],
     # Kurallar özeti
     rules_txt = Text()
     rules_txt.append("\n📋 Aktif Kurallar\n", style="bold yellow")
-    rules_txt.append("  • Spread > limit → ATLA\n", style="dim")
-    rules_txt.append("  • high_vol rejim → İŞLEM YOK\n", style="dim")
-    rules_txt.append("  • low_vol rejim  → Mean-Reversion\n", style="dim")
-    rules_txt.append("  • trending rejim → Trend-Follow\n", style="dim")
-    rules_txt.append("  • Meta conf < 0.55 → ATLA\n", style="dim")
-    rules_txt.append("  • Risk/işlem: %0.5 NAV\n", style="dim")
+    rules_txt.append("  • Gerçek kurallar (Test/Ana) Engine (main.py) ekranında loglanmaktadır.\n", style="dim")
+    rules_txt.append("  • İşlem detayları, Risk Filtreleri vb. için lutfen bu ekrani degil,\n", style="dim")
+    rules_txt.append("  • Engine (main.py) konsol loglarını takip ediniz.\n", style="dim")
 
     layout["right"].split_column(
         Layout(Panel(pos_tbl, title="[bold]Pozisyonlar[/bold]")),
