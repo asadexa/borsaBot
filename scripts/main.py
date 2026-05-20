@@ -198,6 +198,24 @@ async def main(
         default_twap_duration=1, # 1 sn -- esasen anlik
     )
 
+    # ── R-based Stop Manager ──────────────────────────────────────────────
+    from borsabot.execution.stop_manager import StopManager, StopConfig
+    from borsabot.execution.trade_state import ActiveTrade
+
+    _stop_cfg = StopConfig(
+        breakeven_r  = user_settings.get("BREAKEVEN_R",  1.0),
+        partial_r    = user_settings.get("PARTIAL_R",    1.5),
+        partial_pct  = user_settings.get("PARTIAL_PCT",  0.50),
+        trail_r      = user_settings.get("TRAIL_R",      2.0),
+        min_lot_step = user_settings.get("MIN_LOT_STEP", 0.01),
+    )
+    stop_manager = StopManager(broker, _stop_cfg)
+    log.info(
+        "StopManager aktif: breakeven=+%.1fR  partial=+%.1fR(%.0f%%)  trail=+%.1fR",
+        _stop_cfg.breakeven_r, _stop_cfg.partial_r,
+        _stop_cfg.partial_pct * 100, _stop_cfg.trail_r,
+    )
+
     # ── Per-symbol tick history buffers (rolling 500 ticks) ───────────────
     tick_buffers: dict[str, deque] = {s: deque(maxlen=500) for s in symbols}
     seq_counter: dict[str, int] = {s: 0 for s in symbols}
@@ -272,6 +290,12 @@ async def main(
                 bid, ask = raw.get("bid"), raw.get("ask")
                 if bid and ask:
                     books[sym].apply_snapshot({"bids": [[bid, 1.0]], "asks": [[ask, 1.0]], "lastUpdateId": seq_counter[sym]})
+
+            # ── R-Stop tick forwarding ────────────────────────────────────
+            _bid = raw.get("bid")
+            _ask = raw.get("ask")
+            if _bid and _ask and stop_manager.active_count > 0:
+                await stop_manager.on_price(sym, bid=float(_bid), ask=float(_ask))
 
             tick_data = {
                 "time":  pd.Timestamp.now(),
@@ -387,8 +411,9 @@ async def main(
         if confidence < CONF_MIN:
             log.info("[%s] BLOKE: Guven dusuk %.3f < %.2f", sym, confidence, CONF_MIN)
             return
-        if adx != 0.0 and adx < ADX_MIN:
-            log.info("[%s] BLOKE: ADX dusuk %.1f < %.1f", sym, adx, ADX_MIN)
+        # ADX=0.0 demek hesaplanamadi/yok demek — ADX_MIN>0 iken bu da engelleme sebebidir
+        if ADX_MIN > 0.0 and adx < ADX_MIN:
+            log.info("[%s] BLOKE: ADX dusuk %.1f < %.1f (0.0=hesaplanamadi)", sym, adx, ADX_MIN)
             return
             
         # ── Dynamic SL/TP Calculation (Rule set logic) ────────────────────
@@ -526,6 +551,23 @@ async def main(
             orders = await execution.on_signal(signal_evt, book, qty)
             for order in orders:
                 log.info("Order: %s %s status=%s", sym, signal_evt.side.value, order.state)
+                # ── Register with StopManager ─────────────────────────────
+                if sl_price and order.avg_price and order.avg_price > 0:
+                    _ticket = int(order.broker_order_id) if order.broker_order_id.isdigit() else 0
+                    _trade = ActiveTrade(
+                        symbol      = sym,
+                        side        = signal_evt.side,
+                        entry_price = float(order.avg_price),
+                        initial_sl  = float(sl_price),
+                        volume      = float(qty),
+                        ticket      = _ticket,
+                        strategy_id = signal_evt.strategy_id or "main",
+                    )
+                    stop_manager.register(_trade)
+                    log.info(
+                        "[%s] StopManager: trade kaydedildi ticket=%d entry=%.5f sl=%.5f vol=%.2f",
+                        sym, _ticket, order.avg_price, sl_price, qty,
+                    )
 
     # ── Start market data streams ─────────────────────────────────────────
     log.info("Streaming market data for: %s", symbols)
@@ -812,7 +854,17 @@ if __name__ == "__main__":
         print()
         return settings
 
-    user_settings = run_interactive_wizard()
+    # ── Launcher'dan env variable ile preset geliyorsa wizard'ı atla ──────────
+    _env_preset = os.getenv("BORSABOT_PRESET", "").strip().lower()
+    if _env_preset in PRESETS:
+        _chosen = dict(PRESETS[_env_preset])
+        user_settings = {k: v for k, v in _chosen.items() if not k.startswith("_")}
+        print(f"\n  [LAUNCHER] Preset otomatik secildi: {_env_preset.upper()} — {_chosen.get('_name', '')}")
+        for k, v in user_settings.items():
+            print(f"    {k:<26} = {v}")
+        print()
+    else:
+        user_settings = run_interactive_wizard()
 
     asyncio.run(main(
         broker_name=args.broker,

@@ -47,7 +47,11 @@ class MT5Live:
             import MetaTrader5 as mt5
             self._mt5 = mt5
             mt5.initialize()
-            mt5.login(account, password, server)
+            # initialize() sonrasi zorla login — baska hesap aciksa bile gecis yapar
+            login_ok = mt5.login(account, password, server)
+            if not login_ok:
+                import sys
+                print(f"[Dashboard] MT5 login basarisiz: {mt5.last_error()}", file=sys.stderr)
             self._ok = True
         except Exception:
             self._ok = False

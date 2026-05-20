@@ -59,6 +59,8 @@ hidden_imports = [
     "borsabot.execution",
     "borsabot.execution.engine",
     "borsabot.execution.order_fsm",
+    "borsabot.execution.trade_state",
+    "borsabot.execution.stop_manager",
     "borsabot.storage",
     "borsabot.storage.redis_cache",
     "borsabot.storage.timescale",

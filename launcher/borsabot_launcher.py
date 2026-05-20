@@ -132,12 +132,12 @@ def load_state() -> dict:
             saved = dict(_DEFAULT_STATE)
     else:
         saved = dict(_DEFAULT_STATE)
-    # .env'deki hesap bilgileri state'i ezer (tek kaynak)
+    # .env'den SADECE JSON'da eksik olan alanları doldur (JSON her zaman kazanır)
     env_creds = _load_env_values()
     for k in ["mt5_account", "mt5_password", "mt5_server",
               "binance_key", "binance_secret",
               "default_symbols", "nav_usd"]:
-        if env_creds.get(k):
+        if env_creds.get(k) and not saved.get(k):
             saved[k] = env_creds[k]
     return saved
 
@@ -289,12 +289,27 @@ def start_docker_services(status_cb: Callable[[str], None] | None = None) -> boo
         return False
 
 
-def open_mt5() -> bool:
+def open_mt5(account: str = "", password: str = "", server: str = "") -> bool:
+    """MT5'i ac. Eger hesap bilgileri verilirse komut satirindan login yap."""
     if not MT5_EXE.exists():
         return False
     if check_mt5_running():
+        # Zaten aciksa doğru hesaba geçiş için Python API üzerinden login
+        if account and password and server:
+            try:
+                import MetaTrader5 as mt5
+                mt5.initialize()
+                if mt5.account_info() and str(mt5.account_info().login) != str(account):
+                    mt5.login(int(account), password, server)
+                mt5.shutdown()
+            except Exception:
+                pass
         return True
-    subprocess.Popen([str(MT5_EXE)])
+    # MT5 komut satiri: /login hesap /password sifre /server sunucu
+    cmd = [str(MT5_EXE)]
+    if account and password and server:
+        cmd += ["/login", str(account), "/password", password, "/server", server]
+    subprocess.Popen(cmd)
     time.sleep(6)
     return check_mt5_running()
 
@@ -997,7 +1012,11 @@ class MT5ConfigPage(BasePage):
     def _show_next_btn(self):
         styled_btn(self._btn_frame, "Devam Et →", lambda: self.app.show_page("account"),
                    color=GREEN, width=20).pack(side="left", padx=8)
-        styled_btn(self._btn_frame, "MT5 Ac", lambda: open_mt5(),
+        styled_btn(self._btn_frame, "MT5 Ac", lambda: open_mt5(
+            self.state.get("mt5_account", ""),
+            self.state.get("mt5_password", ""),
+            self.state.get("mt5_server", ""),
+        ),
                    color=ACCENT, width=14).pack(side="left", padx=8)
 
 
@@ -1012,9 +1031,8 @@ class AccountPage(BasePage):
         self._vars: dict[str, tk.StringVar] = {}
         self._build()
 
-    def _build(self):
-        self._header("🔑", "Hesap Bilgileri",
-                     "Broker hesabinizi tanimlayin — dogru ve guncel tutun")
+    def _build(self, icon="🔑", title="Hesap Bilgileri", subtitle="Broker hesabinizi tanimlayin — dogru ve guncel tutun"):
+        self._header(icon, title, subtitle)
 
         # Broker selection
         brow = self._row(pady=8)
@@ -1045,9 +1063,9 @@ class AccountPage(BasePage):
 
         tk.Frame(self, bg=BG, height=10).pack()
 
-        btn_f = tk.Frame(self, bg=BG)
-        btn_f.pack()
-        styled_btn(btn_f, "  Kaydet ve Devam  ", self._save,
+        self._btn_frame = tk.Frame(self, bg=BG)
+        self._btn_frame.pack()
+        styled_btn(self._btn_frame, "  Kaydet ve Devam  ", self._save,
                    color=GREEN, width=22).pack(side="left", padx=8)
 
         self._on_broker_change()
@@ -1184,10 +1202,26 @@ class SettingsPage(AccountPage):
         # Re-use AccountPage but return to main
 
     def _build(self):
-        self._header("⚙️", "Ayarlar", "Hesap bilgileri ve islem parametreleri")
-        super()._build()
+        super()._build(icon="⚙️", title="Ayarlar", subtitle="Hesap bilgileri ve islem parametreleri")
         # Add back button to btn area
-        # (btn already created in AccountPage._build, add back btn)
+        styled_btn(self._btn_frame, "  Geri Dön (Iptal)  ", lambda: self.app.show_page("main"),
+                   color=RED, width=22).pack(side="left", padx=8)
+
+    def on_show(self):
+        """Her acilista disk'ten taze oku — stale (eski) deger gösterimini engeller."""
+        fresh = load_state()
+        self.state.update(fresh)
+        self.app.state.update(fresh)
+        # UI kutularini tazele
+        for key, var in self._vars.items():
+            val = fresh.get(key, "")
+            var.set(str(val) if val else "")
+        # Broker dropdown
+        if hasattr(self, "_broker_var"):
+            self._broker_var.set(fresh.get("broker", "mt5"))
+        # Paper mode checkbox
+        if hasattr(self, "_paper_var"):
+            self._paper_var.set(fresh.get("paper_mode", False))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1427,7 +1461,11 @@ class MainLauncherPage(BasePage):
         elif mt5_installed:
             self._set_card("mt5", False, "Yuklu fakat kapali")
             self._log_line("MetaTrader 5: Yuklu fakat kapali — aciliyor...", "warn")
-            threading.Thread(target=lambda: open_mt5(), daemon=True).start()
+            threading.Thread(target=lambda: open_mt5(
+                self.state.get("mt5_account", ""),
+                self.state.get("mt5_password", ""),
+                self.state.get("mt5_server", ""),
+            ), daemon=True).start()
         else:
             self._set_card("mt5", False, "Kurulu degil")
             self._log_line("MetaTrader 5: Kurulu degil — kurulum sihirbazini calistirin", "err")
@@ -1483,6 +1521,21 @@ class MainLauncherPage(BasePage):
         env = os.environ.copy()
         env["BORSABOT_PRESET"] = preset
 
+        # ── Kritik: state'teki dogru credentials'lari OS env'deki eski
+        # degerlerin uzerine zorla yaz. Pydantic-settings env var'i .env'e
+        # tercih eder — bu satirlar olmadan Windows env'deki eski hesap no
+        # kazanir ve bot yanlis hesapla baglanir.
+        fresh = load_state()
+        env["MT5_ACCOUNT"]  = str(fresh.get("mt5_account", ""))
+        env["MT5_PASSWORD"] = str(fresh.get("mt5_password", ""))
+        env["MT5_SERVER"]   = str(fresh.get("mt5_server",   ""))
+        env["NAV_USD"]      = str(fresh.get("nav_usd",      nav))
+        env["DEFAULT_SYMBOLS"] = " ".join(symbols)
+        self._log_line(
+            f"MT5 hesap zorla ayarlandi: {env['MT5_ACCOUNT']} @ {env['MT5_SERVER']}",
+            "muted"
+        )
+
         py = self._get_python()
         script_args = [
             "--broker", broker,
@@ -1520,8 +1573,13 @@ class MainLauncherPage(BasePage):
             cmd = [sys.executable, "--run-dashboard"] + script_args
         else:
             cmd = [py, str(SCRIPTS_DIR / "dashboard.py")] + script_args
+        dash_env = os.environ.copy()
+        fresh = load_state()
+        dash_env["MT5_ACCOUNT"]  = str(fresh.get("mt5_account", ""))
+        dash_env["MT5_PASSWORD"] = str(fresh.get("mt5_password", ""))
+        dash_env["MT5_SERVER"]   = str(fresh.get("mt5_server",   ""))
         threading.Thread(target=lambda: self._launch_proc(
-            cmd, os.environ.copy(), "dashboard"
+            cmd, dash_env, "dashboard"
         ), daemon=True).start()
 
     def _launch_proc(self, cmd: list, env: dict, kind: str):

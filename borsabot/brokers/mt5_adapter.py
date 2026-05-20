@@ -56,14 +56,11 @@ class MT5Adapter(BrokerGateway):
         )
 
         # initialize() + login tek seferde (IPC bağlantısı için gerekli)
-        init_kwargs: dict = {
-            "login":    self._account,
-            "password": self._password,
-            "server":   self._server,
-        }
+        init_kwargs: dict = {}
         if mt5_path:
             init_kwargs["path"] = mt5_path
 
+        # Once sadece initialize() — MT5 programını başlat
         if not mt5.initialize(**init_kwargs):
             # MT5 yeni açıldıysa IPC oturması için retry
             import time as _time
@@ -78,11 +75,29 @@ class MT5Adapter(BrokerGateway):
                     f"MT5 initialize() 5 denemede başarısız: {mt5.last_error()}\n"
                     f"MT5 masaüstü uygulamasının açık ve giriş yapılmış olduğundan emin olun."
                 )
-        self._connected = True
+
+        # Şimdi doğru hesaba login yap — MT5 farklı bir hesapla açık olsa bile zorla geçiş yapar
+        login_ok = mt5.login(self._account, self._password, self._server)
+        if not login_ok:
+            err = mt5.last_error()
+            log.error("MT5 login başarısız: account=%s server=%s hata=%s", self._account, self._server, err)
+            raise ConnectionError(
+                f"MT5 login() başarısız: hesap={self._account} hata={err}\n"
+                f"Hesap numarası, şifre ve sunucu adını kontrol edin."
+            )
+
+        # Doğru hesaba bağlandığımızı doğrula
         info = mt5.account_info()
+        if info and info.login != self._account:
+            log.error("MT5 YANLIŞ HESAP: beklenen=%d gerçek=%d — login zorlanıyor",
+                      self._account, info.login)
+            mt5.login(self._account, self._password, self._server)
+            info = mt5.account_info()
+
+        self._connected = True
         bal  = f"{info.balance:.2f} {info.currency}" if info else "?"
         log.info("MT5Adapter connected  account=%d  server=%s  balance=%s",
-                 self._account, self._server, bal)
+                 info.login if info else self._account, self._server, bal)
 
     async def disconnect(self) -> None:
         if _MT5_AVAILABLE:
@@ -222,6 +237,104 @@ class MT5Adapter(BrokerGateway):
         df.set_index("time", inplace=True)
         df.rename(columns={"tick_volume": "volume"}, inplace=True)
         return df[["open", "high", "low", "close", "volume"]]
+
+    # ── R-based Stop Management helpers ────────────────────────────────────
+
+    async def modify_sl(self, ticket: int, new_sl: float) -> bool:
+        """
+        Modify the stop loss of an existing MT5 position.
+
+        Uses TRADE_ACTION_SLTP which modifies SL/TP on an open position
+        without closing it. Returns True on success.
+        """
+        if not _MT5_AVAILABLE:
+            return False
+
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            log.error("modify_sl: position ticket=%d not found", ticket)
+            return False
+
+        pos = positions[0]
+        request = {
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "symbol":   pos.symbol,
+            "position": ticket,
+            "sl":       new_sl,
+            "tp":       pos.tp,   # keep existing TP unchanged
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            log.error(
+                "modify_sl failed ticket=%d new_sl=%.5f retcode=%s comment=%s",
+                ticket,
+                new_sl,
+                result.retcode if result else "None",
+                result.comment if result else "",
+            )
+            return False
+
+        log.info("modify_sl ok: ticket=%d sl → %.5f", ticket, new_sl)
+        return True
+
+    async def partial_close(self, ticket: int, volume: float) -> bool:
+        """
+        Partially close an MT5 position by sending an opposite-side market order.
+
+        MT5 does not have a native "partial close" command; the standard
+        approach is to send a market order in the opposite direction with
+        the position ticket set, which reduces the position size.
+
+        Returns True on success.
+        """
+        if not _MT5_AVAILABLE:
+            return False
+
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            log.error("partial_close: position ticket=%d not found", ticket)
+            return False
+
+        pos    = positions[0]
+        symbol = pos.symbol
+        # Opposite order type closes the position
+        close_type = (
+            mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY
+            else mt5.ORDER_TYPE_BUY
+        )
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            log.error("partial_close: no tick for %s", symbol)
+            return False
+
+        price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+
+        request = {
+            "action":    mt5.TRADE_ACTION_DEAL,
+            "symbol":    symbol,
+            "volume":    float(round(volume, 2)),
+            "type":      close_type,
+            "position":  ticket,        # links to the existing position
+            "price":     price,
+            "deviation": 20,
+            "magic":     20240101,
+            "comment":   f"partial_close:{ticket}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            log.error(
+                "partial_close failed ticket=%d vol=%.2f retcode=%s comment=%s",
+                ticket,
+                volume,
+                result.retcode if result else "None",
+                result.comment if result else "",
+            )
+            return False
+
+        log.info("partial_close ok: ticket=%d closed %.2f lots", ticket, volume)
+        return True
 
     async def stream_market_data(
         self,
