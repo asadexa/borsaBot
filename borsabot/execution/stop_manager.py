@@ -82,6 +82,9 @@ class StopManager:
         manager.remove(ticket)
     """
 
+    # Max broker call retries per milestone before skipping
+    MAX_RETRIES = 3
+
     def __init__(
         self,
         broker: "BrokerGateway",
@@ -91,6 +94,10 @@ class StopManager:
         self.cfg    = config or StopConfig()
         # ticket → ActiveTrade
         self._trades: dict[int, ActiveTrade] = {}
+        # ticket → retry count for the current milestone action
+        self._retry_counts: dict[int, int] = {}
+        # Auto-increment for ticket=0 fallback
+        self._next_synthetic_ticket = -1
 
     # ── Trade registry ────────────────────────────────────────────────────
 
@@ -103,7 +110,16 @@ class StopManager:
                 trade.ticket,
             )
             return
+        # Prevent ticket=0 collisions (e.g. Binance UUID order IDs)
+        if trade.ticket == 0:
+            trade.ticket = self._next_synthetic_ticket
+            self._next_synthetic_ticket -= 1
+            log.info(
+                "StopManager: assigned synthetic ticket=%d for %s",
+                trade.ticket, trade.symbol,
+            )
         self._trades[trade.ticket] = trade
+        self._retry_counts[trade.ticket] = 0
         log.info(
             "StopManager: registered ticket=%d %s %s "
             "entry=%.5f  sl=%.5f  risk=%.5fpip  vol=%.2f",
@@ -115,6 +131,7 @@ class StopManager:
     def remove(self, ticket: int) -> None:
         """Remove a trade (called when the position closes)."""
         self._trades.pop(ticket, None)
+        self._retry_counts.pop(ticket, None)
         log.info("StopManager: removed ticket=%d", ticket)
 
     @property
@@ -173,6 +190,20 @@ class StopManager:
         ):
             await self._do_trail_1r(trade)
 
+    # ── Retry management ──────────────────────────────────────────────
+
+    def _check_retry(self, trade: ActiveTrade, action_name: str) -> bool:
+        """Increment retry count; return True if under MAX_RETRIES, else skip milestone."""
+        count = self._retry_counts.get(trade.ticket, 0) + 1
+        self._retry_counts[trade.ticket] = count
+        if count >= self.MAX_RETRIES:
+            log.warning(
+                "StopManager [%s] ticket=%d: %d retries exhausted — skipping milestone",
+                action_name, trade.ticket, count,
+            )
+            return False  # caller should force-advance milestone
+        return True  # still has retries left
+
     # ── Actions ───────────────────────────────────────────────────────────
 
     async def _do_breakeven(self, trade: ActiveTrade) -> None:
@@ -186,6 +217,12 @@ class StopManager:
         if ok:
             trade.current_sl = new_sl
             trade.milestone  = RMilestone.BREAKEVEN
+            self._retry_counts[trade.ticket] = 0  # reset for next milestone
+        elif not self._check_retry(trade, "BREAKEVEN"):
+            # Retries exhausted — force-advance to prevent infinite loop
+            trade.current_sl = new_sl
+            trade.milestone  = RMilestone.BREAKEVEN
+            self._retry_counts[trade.ticket] = 0
 
     async def _do_partial_close(self, trade: ActiveTrade) -> None:
         """Close 50 % of remaining volume, SL stays at entry."""
@@ -196,6 +233,7 @@ class StopManager:
                 trade.ticket, self.cfg.min_lot_step,
             )
             trade.milestone = RMilestone.PARTIAL_HALF  # advance anyway
+            self._retry_counts[trade.ticket] = 0
             return
 
         log.info(
@@ -206,10 +244,15 @@ class StopManager:
         if ok:
             trade.remaining_volume -= close_vol
             trade.milestone         = RMilestone.PARTIAL_HALF
+            self._retry_counts[trade.ticket] = 0  # reset for next milestone
             log.info(
                 "StopManager [PARTIAL CLOSE] ok — remaining vol=%.2f  sl stays at %.5f",
                 trade.remaining_volume, trade.current_sl,
             )
+        elif not self._check_retry(trade, "PARTIAL_CLOSE"):
+            # Retries exhausted — advance milestone to prevent infinite loop
+            trade.milestone = RMilestone.PARTIAL_HALF
+            self._retry_counts[trade.ticket] = 0
 
     async def _do_trail_1r(self, trade: ActiveTrade) -> None:
         """Move SL to entry + 1R — locking in 1R minimum profit."""
@@ -222,6 +265,11 @@ class StopManager:
         if ok:
             trade.current_sl = new_sl
             trade.milestone  = RMilestone.TRAIL_1R
+            self._retry_counts[trade.ticket] = 0
+        elif not self._check_retry(trade, "TRAIL_1R"):
+            trade.current_sl = new_sl
+            trade.milestone  = RMilestone.TRAIL_1R
+            self._retry_counts[trade.ticket] = 0
 
     # ── Broker call helpers ───────────────────────────────────────────────
 
@@ -271,6 +319,51 @@ class StopManager:
         step = self.cfg.min_lot_step
         # Add tiny epsilon before floor to avoid 1.0/0.01 == 99.9999... issue
         return round(math.floor(volume / step + 1e-9) * step, 10)
+
+    # ── Position sync (BUG #1 fix) ────────────────────────────────────────
+
+    async def sync_positions(self) -> int:
+        """Remove trades whose positions no longer exist at the broker.
+
+        Call periodically (e.g. every 30s) to clean up orphaned trades
+        that closed externally (TP hit, manual close, SL hit).
+
+        Returns:
+            Number of orphaned trades removed.
+        """
+        if not self._trades:
+            return 0
+
+        try:
+            live_positions = await self.broker.get_positions()
+        except Exception as exc:
+            log.warning("StopManager.sync_positions: broker error: %s", exc)
+            return 0
+
+        # Collect tickets that are in StopManager but NOT in broker positions
+        # For MT5, get_positions returns {symbol: volume}.  We need to cross-
+        # reference by symbol because tickets aren't in the dict.
+        # Use a conservative approach: if the symbol has zero position, remove
+        # ALL trades for that symbol.
+        live_symbols = {sym for sym, qty in live_positions.items() if abs(qty) > 1e-10}
+
+        orphaned = [
+            ticket
+            for ticket, trade in list(self._trades.items())
+            if trade.symbol not in live_symbols
+        ]
+
+        for ticket in orphaned:
+            trade = self._trades.get(ticket)
+            if trade:
+                log.info(
+                    "StopManager [SYNC] removing orphaned trade: "
+                    "ticket=%d %s %s (position no longer open)",
+                    ticket, trade.symbol, trade.side.value,
+                )
+            self.remove(ticket)
+
+        return len(orphaned)
 
     # ── Debug helpers ─────────────────────────────────────────────────────
 

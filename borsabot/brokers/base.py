@@ -112,6 +112,18 @@ class MockBrokerGateway(BrokerGateway):
     async def get_balance(self) -> dict[str, float]:
         return {"USDT": 100_000.0}
 
+    # ── Stop management (used by StopManager) ─────────────────────────
+
+    async def modify_sl(self, ticket: int, new_sl: float) -> bool:
+        """Mock SL modification — always succeeds."""
+        log.debug("MockBroker: modify_sl ticket=%d sl=%.5f", ticket, new_sl)
+        return True
+
+    async def partial_close(self, ticket: int, volume: float) -> bool:
+        """Mock partial close — always succeeds."""
+        log.debug("MockBroker: partial_close ticket=%d vol=%.2f", ticket, volume)
+        return True
+
     async def get_historical_klines(self, symbol: str, timeframe: str = "1d", limit: int = 100) -> "pd.DataFrame":
         import pandas as pd
         import numpy as np

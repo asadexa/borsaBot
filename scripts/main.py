@@ -198,7 +198,10 @@ async def main(
         default_twap_duration=1, # 1 sn -- esasen anlik
     )
 
-    # ── R-based Stop Manager ──────────────────────────────────────────────
+    # ── Ensure user_settings is a dict (guard against None) ───────────────
+    user_settings = user_settings or {}
+
+    # ── State and Cooldown Management ──────────────────────────────────────────────
     from borsabot.execution.stop_manager import StopManager, StopConfig
     from borsabot.execution.trade_state import ActiveTrade
 
@@ -221,7 +224,6 @@ async def main(
     seq_counter: dict[str, int] = {s: 0 for s in symbols}
 
     # ── State and Cooldown Management ─────────────────────────────────────
-    user_settings = user_settings or {}
     RR_RATIO     = user_settings.get("RISK_REWARD_RATIO",    2.0)
     SL_ATR_MULT  = user_settings.get("SL_ATR_MULTIPLIER",   1.5)
     CONF_MIN     = user_settings.get("CONFIDENCE_THRESHOLD", 0.60)
@@ -252,6 +254,23 @@ async def main(
                 log.error("STALE FEED: %s", alert)
 
     watchdog_task = asyncio.create_task(_stale_feed_watchdog())
+
+    # ── Background position sync for StopManager ──────────────────────────
+    _SYNC_INTERVAL = 30  # seconds
+
+    async def _position_sync_loop():
+        """Every 30s, remove trades from StopManager whose positions closed."""
+        while not shutdown_event.is_set():
+            await asyncio.sleep(_SYNC_INTERVAL)
+            if stop_manager.active_count > 0:
+                try:
+                    removed = await stop_manager.sync_positions()
+                    if removed > 0:
+                        log.info("StopManager sync: %d orphaned trade(s) removed", removed)
+                except Exception as exc:
+                    log.warning("StopManager sync error: %s", exc)
+
+    sync_task = asyncio.create_task(_position_sync_loop())
 
     # ── Market data callback ──────────────────────────────────────────────
     async def on_tick(raw: dict) -> None:
@@ -417,7 +436,16 @@ async def main(
             return
             
         # ── Dynamic SL/TP Calculation (Rule set logic) ────────────────────
-        atr_val = float(features_dict.get("atr_14", 0.0050))
+        # Sembol bazlı ATR default — EURUSD ~0.005, XAUUSD ~25-35$
+        _ATR_DEFAULTS = {
+            "EURUSD": 0.0050,
+            "GBPUSD": 0.0060,
+            "USDJPY": 0.70,
+            "XAUUSD": 28.0,
+            "XAGUSD": 0.50,
+        }
+        atr_default = _ATR_DEFAULTS.get(sym, 0.0050)
+        atr_val = float(features_dict.get("atr_14", atr_default))
         dist = atr_val * SL_ATR_MULT
         current_price = book.mid_price()
         
@@ -587,7 +615,8 @@ async def main(
     for task in stream_tasks:
         task.cancel()
     watchdog_task.cancel()
-    await asyncio.gather(*stream_tasks, watchdog_task, return_exceptions=True)
+    sync_task.cancel()
+    await asyncio.gather(*stream_tasks, watchdog_task, sync_task, return_exceptions=True)
 
     lake.flush()
     await cache.stop()
@@ -759,10 +788,10 @@ if __name__ == "__main__":
         "ana": {
             "_name": "Ana Kurallar (Production)",
             "_desc": "Düşük riskli, uzun vadeli, yüksek güven filtreli üretim kuralları.",
-            "RISK_REWARD_RATIO":   2.5,
-            "SL_ATR_MULTIPLIER":   1.5,
+            "RISK_REWARD_RATIO":    2.5,
+            "SL_ATR_MULTIPLIER":    1.5,
             "CONFIDENCE_THRESHOLD": 0.65,
-            "ADX_MINIMUM":         25.0,
+            "ADX_MINIMUM":          25.0,
             "COOLDOWN_HOURS":       8.0,
         },
         "test": {
@@ -774,6 +803,26 @@ if __name__ == "__main__":
             "ADX_MINIMUM":          0.0,   # ADX filtresi KAPALI
             "COOLDOWN_HOURS":       0.0,   # Bekleme YOK
             "META_CONF_MIN":        0.0,   # Meta model filtresi TAMAMEN BYPASS
+        },
+        "altin": {
+            "_name": "Altın Kuralları (XAUUSD)",
+            "_desc": "XAUUSD için optimize edilmiş. Geniş ATR mesafesi, uygun SL/TP, EURUSD ana kuralları baz alınmıştır.",
+            "RISK_REWARD_RATIO":    2.0,   # 1:2 R/R — altında trend uzun sürer
+            "SL_ATR_MULTIPLIER":    1.5,   # ATR x 1.5 ≈ $37-52 SL mesafesi
+            "CONFIDENCE_THRESHOLD": 0.60,  # Biraz daha esnek (volatilite yüksek)
+            "ADX_MINIMUM":          20.0,  # Trend filtresi (altın yatay hareket yapar)
+            "COOLDOWN_HOURS":       4.0,   # Daha kısa bekleme (altın hızlı hareket eder)
+            "META_CONF_MIN":        0.50,  # Meta filtre hafif aktif
+        },
+        "altin_test": {
+            "_name": "Altın Test (AGRESIF)",
+            "_desc": "XAUUSD test modu — tüm filtreler gevşek. Hızlı pozisyon girişi için.",
+            "RISK_REWARD_RATIO":    1.5,   # 1:1.5 R/R
+            "SL_ATR_MULTIPLIER":    1.0,   # ATR x 1 ≈ $25-35 SL mesafesi
+            "CONFIDENCE_THRESHOLD": 0.50,  # Alt sınır
+            "ADX_MINIMUM":          0.0,   # ADX KAPALI
+            "COOLDOWN_HOURS":       0.0,   # Bekleme YOK
+            "META_CONF_MIN":        0.0,   # Meta BYPASS
         },
     }
 
@@ -797,14 +846,16 @@ if __name__ == "__main__":
         print()
         print("══════════════════════════════════════════════════════")
         print("  Seçenekler:")
-        print("    [1]  Ana Kurallar  — Üretim preset'i")
-        print("    [2]  Test Kuralları — Agresif / veri toplama preset'i")
-        print("    [3]  Özel Düzenle  — Kendi değerlerini gir")
+        print("    [1]  Ana Kurallar     — EURUSD üretim preset'i")
+        print("    [2]  Test Kuralları   — EURUSD agresif / veri toplama")
+        print("    [3]  Altın Kuralları  — XAUUSD üretim preset'i")
+        print("    [4]  Altın Test       — XAUUSD agresif test")
+        print("    [5]  Özel Düzenle    — Kendi değerlerini gir")
         print("    [ENTER] → Varsayılan (Ana Kurallar)")
         print("══════════════════════════════════════════════════════")
 
         try:
-            raw = input("  Seçiminiz [1/2/3, ENTER=1]: ").strip()
+            raw = input("  Seçiminiz [1/2/3/4/5, ENTER=1]: ").strip()
         except Exception:
             raw = ""
 
@@ -818,6 +869,14 @@ if __name__ == "__main__":
             print(f"\n✅  Test Kuralları seçildi.")
 
         elif raw == "3":
+            chosen = dict(PRESETS["altin"])
+            print(f"\n✅  Altın Kuralları seçildi (XAUUSD).")
+
+        elif raw == "4":
+            chosen = dict(PRESETS["altin_test"])
+            print(f"\n✅  Altın Test Kuralları seçildi (XAUUSD agresif).")
+
+        elif raw == "5":
             # Ana preset başlangıç noktası olsun
             chosen = dict(PRESETS["ana"])
             print("\n  Düzenleme modu — boş bırakılırsa mevcut değer korunur:")
