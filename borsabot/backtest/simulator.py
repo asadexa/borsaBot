@@ -67,6 +67,11 @@ class BacktestSimulator:
 
         returns_list: list[float] = []
 
+        # Per-fill transaction cost as a fraction of turned-over capital.
+        # A position is fully invested (|position| == 1), so each entry and
+        # each exit turns over the whole book and pays this drag on equity.
+        cost_rate = self._total_cost_bps / 10_000.0
+
         for i, (ts, sig) in enumerate(signals.items()):
             if ts not in prices.index:
                 continue
@@ -86,6 +91,7 @@ class BacktestSimulator:
                         price, OrderSide.SELL if position > 0 else OrderSide.BUY
                     )
                     pnl = (exit_price - entry_price) * position
+                    capital *= (1.0 - cost_rate)    # pay exit cost on equity
                     trades.append({
                         "exit_ts":    ts,
                         "exit_price": exit_price,
@@ -97,6 +103,7 @@ class BacktestSimulator:
                 entry_price = self.fill_price(
                     price, OrderSide.BUY if sig > 0 else OrderSide.SELL
                 )
+                capital *= (1.0 - cost_rate)        # pay entry cost on equity
                 position = int(sig)
                 if trades:
                     trades[-1].update({"entry_ts": ts, "entry_price": entry_price})
@@ -107,6 +114,7 @@ class BacktestSimulator:
                     price, OrderSide.SELL if position > 0 else OrderSide.BUY
                 )
                 pnl = (exit_price - entry_price) * position
+                capital *= (1.0 - cost_rate)        # pay exit cost on equity
                 trades.append({
                     "exit_ts": ts, "exit_price": exit_price,
                     "pnl": pnl, "side": "long" if position > 0 else "short",

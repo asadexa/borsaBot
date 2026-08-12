@@ -14,11 +14,19 @@ def sharpe_ratio(returns: pd.Series, periods_per_year: int = 252) -> float:
 
 
 def sortino_ratio(returns: pd.Series, periods_per_year: int = 252) -> float:
-    """Sortino Ratio: penalizes only downside volatility."""
-    downside = returns[returns < 0]
-    if downside.empty or downside.std() == 0:
+    """Sortino Ratio: penalizes only downside volatility.
+
+    Denominator is the downside deviation = sqrt(mean(min(0, r)**2)) computed
+    over ALL observations (not the sample std of the negative subset, which
+    understates risk and uses the wrong N).
+    """
+    if returns.empty:
         return 0.0
-    return float(returns.mean() / downside.std() * np.sqrt(periods_per_year))
+    downside_sq = np.minimum(returns, 0.0) ** 2
+    downside_dev = float(np.sqrt(downside_sq.mean()))
+    if downside_dev == 0:
+        return 0.0
+    return float(returns.mean() / downside_dev * np.sqrt(periods_per_year))
 
 
 def max_drawdown(equity: pd.Series) -> float:
@@ -73,6 +81,10 @@ def full_report(returns: pd.Series, equity: pd.Series) -> dict:
         "calmar":       calmar_ratio(returns, equity),
         "hit_rate":     hit_rate(returns),
         "profit_factor": profit_factor(returns),
-        "total_return": float((equity.iloc[-1] / equity.iloc[0]) - 1) if not equity.empty else 0.0,
+        "total_return": (
+            float((equity.iloc[-1] / equity.iloc[0]) - 1)
+            if not equity.empty and equity.iloc[0] != 0
+            else 0.0
+        ),
         "n_trades":     int((returns != 0).sum()),
     }

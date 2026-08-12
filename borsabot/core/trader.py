@@ -377,6 +377,22 @@ class LiveTrader:
             "side":  tick.get("side", "B"),
         })
 
+        # ── Mark open position to market ──────────────────────────────────
+        # Feeds unrealized PnL changes into the risk engine so the daily
+        # drawdown circuit breaker actually trips, and records returns for the
+        # rolling-Sharpe health monitor.
+        if self._risk_engine is not None:
+            pnl_delta, halted = self._risk_engine.mark_to_market(symbol, float(raw_price))
+            if pnl_delta != 0.0:
+                self._trade_returns.append(pnl_delta / max(self._risk_engine.nav, 1e-9))
+            if halted and not getattr(self._risk_engine, "_already_halt_notified", False):
+                self._risk_engine._already_halt_notified = True
+                await self._notifier.send(
+                    "⚠️ <b>RISK ALERT</b>\nTrading halted: daily drawdown limit reached"
+                )
+            if halted:
+                return
+
         # Need sufficient history before generating signals
         history = self._tick_history[symbol]
         if len(history) < max(30, self.cfg.tick_history_size // 4):
@@ -476,7 +492,22 @@ class LiveTrader:
         vol_size_usd = self._risk_engine.vol_adjusted_size(max(daily_vol, 0.001))
         size_usd     = min(vol_size_usd, nav * regime_pct) * meta_conf
 
-        ok, msg = self._risk_engine.check_new_order(symbol, size_usd)
+        # Mid price first — needed both to size the order and to set the entry
+        # basis when reserving exposure. Colab daily models may have no L2 book.
+        try:
+            mid = book.mid_price() if book.is_valid() else float(price_series.iloc[-1])
+        except (StopIteration, RuntimeError, IndexError):
+            mid = float(price_series.iloc[-1]) if len(price_series) > 0 else 0.0
+        if mid <= 0:
+            return
+
+        # Signed order notional: + opens/extends a long, - a short. Reserve the
+        # exposure atomically (check + position update under one lock) so a
+        # concurrent signal can't slip past the limit during the await below.
+        signed_usd = size_usd if side_int > 0 else -size_usd
+        ok, msg, reservation = self._risk_engine.check_and_reserve(
+            symbol, signed_usd, price=mid
+        )
         if not ok:
             log.debug("[%s] Risk blocked: %s", symbol, msg)
             if "halted" in msg.lower() and getattr(self._risk_engine, "_already_halt_notified", False) is False:
@@ -484,14 +515,6 @@ class LiveTrader:
                 await self._notifier.send(f"⚠️ <b>RISK ALERT</b>\n{msg}")
             return
 
-        # Convert USD size to base asset quantity using mid price
-        # Guard: Colab daily models may not have L2 book data yet
-        try:
-            mid = book.mid_price() if book.is_valid() else float(price_series.iloc[-1])
-        except (StopIteration, RuntimeError, IndexError):
-            mid = float(price_series.iloc[-1]) if len(price_series) > 0 else 0.0
-        if mid <= 0:
-            return
         quantity = size_usd / mid
 
         # ── Build signal and execute ──────────────────────────────────────
@@ -510,7 +533,7 @@ class LiveTrader:
                 urgency  = "medium",
             )
             if orders:
-                self._risk_engine.update_position(symbol, size_usd if side_int > 0 else -size_usd)
+                # Exposure was already reserved by check_and_reserve(); keep it.
                 log.info(
                     "[%s] %s %.6f @ mid=%.2f | meta_conf=%.3f | size=$%.0f",
                     symbol, signal.side.value, quantity, mid, meta_conf, size_usd,
@@ -522,7 +545,11 @@ class LiveTrader:
                     f"Price: ${mid:,.2f}\n"
                     f"AI Meta Conf: {meta_conf:.2f}"
                 )
+            else:
+                # Nothing executed — roll the reservation back.
+                self._risk_engine.release(reservation)
         except Exception as exc:
+            self._risk_engine.release(reservation)
             log.warning("[%s] Execution error: %s", symbol, exc)
 
     # ── Health check loop ─────────────────────────────────────────────────

@@ -106,13 +106,17 @@ def triple_barrier_labels(
 
         ret = (path / close.loc[t0]) - 1.0
 
-        # Directional barriers (meta-labeling: multiply by side)
-        pt_barrier =  trgt * pt_sl[0] * side
-        sl_barrier = -trgt * pt_sl[1] * abs(side)
+        # Work in the side's frame: a short (side=-1) profits when price falls.
+        # dir_ret is the return *in the direction of the bet*, so the barriers
+        # become side-independent and correct for both long and short.
+        dir_ret = ret * side
+
+        pt_barrier =  trgt * pt_sl[0]    # profit-take level (bet wins)
+        sl_barrier = -trgt * pt_sl[1]    # stop-loss level   (bet loses)
 
         # Check which barrier is touched first
-        up_cross   = ret[ret >= pt_barrier].index
-        down_cross = ret[ret <= sl_barrier].index
+        up_cross   = dir_ret[dir_ret >= pt_barrier].index
+        down_cross = dir_ret[dir_ret <= sl_barrier].index
 
         up_t   = up_cross[0]   if len(up_cross)   > 0 else pd.NaT
         down_t = down_cross[0] if len(down_cross) > 0 else pd.NaT

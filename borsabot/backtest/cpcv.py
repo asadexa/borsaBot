@@ -137,11 +137,15 @@ class CPCV:
         events: pd.DataFrame,
     ) -> set[int]:
         """
-        Remove training samples whose label evaluation period (t0, t1)
-        overlaps with any test sample's observation start (t0).
+        Remove training samples whose label evaluation span [t0, t1] overlaps
+        the test set's observation span.
 
-        A training sample at time t0_train with label end at t1_train
-        is purged if t1_train >= t0_test for any test sample t0_test.
+        A training sample [t0_train, t1_train] is purged when it overlaps the
+        test span [min_test_start, max_test_end]: t1_train >= min_test_start
+        AND t0_train <= max_test_end. This keeps training data that lies
+        strictly before or strictly after the test window (no leakage), and
+        only drops the genuinely overlapping samples — unlike the previous
+        min-start-only check, which also discarded all post-test training data.
         """
         if "t1" not in events.columns:
             return train_pos   # no events provided — skip purging
@@ -151,6 +155,14 @@ class CPCV:
             return train_pos
 
         min_test_start = min(test_starts)
+        # End of the test observation window: latest label end among test
+        # samples (fall back to the latest test start if t1 is missing).
+        test_ends = [
+            events.loc[t0, "t1"] if t0 in events.index else t0
+            for t0 in test_starts
+        ]
+        max_test_end = max(test_ends) if test_ends else max(test_starts)
+
         purged = set()
 
         for pos in train_pos:
@@ -159,7 +171,7 @@ class CPCV:
             t0 = index[pos]
             if t0 in events.index:
                 t1 = events.loc[t0, "t1"]
-                if t1 >= min_test_start:
+                if t1 >= min_test_start and t0 <= max_test_end:
                     purged.add(pos)
 
         removed = len(purged)
@@ -178,21 +190,24 @@ class CPCV:
         embargo_n: int,
     ) -> set[int]:
         """
-        Remove `embargo_n` training samples immediately after each
-        training→test boundary to prevent leakage via micro-features.
+        Remove `embargo_n` training samples immediately AFTER each test block
+        (López de Prado, Ch.7). Serial correlation lets information from the
+        test labels bleed forward into training features that start just after
+        the test window, so the embargo is applied to the right side of each
+        test interval. (Forward overlap on the left side is already handled by
+        the purge step.)
         """
         if embargo_n <= 0 or not test_pos:
             return train_pos
 
-        # Find positions just before test blocks begin
         max_n = len(index)
         embargo_zone: set[int] = set()
 
         for pos in test_pos:
-            # embargo the embargo_n train samples immediately preceding test
+            # embargo the embargo_n train samples immediately following test
             for offset in range(1, embargo_n + 1):
-                candidate = pos - offset
-                if candidate >= 0 and candidate not in test_pos:
+                candidate = pos + offset
+                if candidate < max_n and candidate not in test_pos:
                     embargo_zone.add(candidate)
 
         return train_pos - embargo_zone

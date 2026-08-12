@@ -68,6 +68,22 @@ def test_profit_factor_above_one_for_profitable(mixed_returns):
     assert pf > 1.0
 
 
+def test_sortino_uses_downside_deviation_over_all_obs():
+    """Sortino denominator is sqrt(mean(min(0,r)**2)) over ALL observations.
+
+    For returns [+0.10, -0.10] the downside deviation is sqrt((0.10**2)/2),
+    not the std of the single negative value (which is 0 and would blow up).
+    """
+    returns = pd.Series([0.10, -0.10])
+    expected_downside_dev = np.sqrt((0.10 ** 2) / 2)
+    expected = returns.mean() / expected_downside_dev * np.sqrt(252)
+    assert sortino_ratio(returns) == pytest.approx(expected)
+
+
+def test_sortino_zero_when_no_downside(positive_returns):
+    assert sortino_ratio(positive_returns) == 0.0
+
+
 def test_backtest_vs_live_no_drift():
     result = backtest_vs_live_drift(1.0, 1.0)
     assert result["sharpe_decay_pct"] == pytest.approx(0.0)

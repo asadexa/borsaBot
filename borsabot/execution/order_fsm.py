@@ -156,12 +156,14 @@ class OrderManager:
                 order.state = OrderStatus.PENDING.value
 
         elif status == OrderStatus.PARTIALLY_FILLED:
+            self._ensure_acknowledged(order)
             order.apply_fill(response.filled_qty - order.filled_qty, response.avg_price)
             if _TRANSITIONS_AVAILABLE:
                 order.partial_fill()
             order.state = OrderStatus.PARTIALLY_FILLED.value
 
         elif status == OrderStatus.FILLED:
+            self._ensure_acknowledged(order)
             order.apply_fill(response.filled_qty - order.filled_qty, response.avg_price)
             if _TRANSITIONS_AVAILABLE:
                 order.full_fill()
@@ -180,6 +182,29 @@ class OrderManager:
                 order.cancel()
             else:
                 order.state = OrderStatus.CANCELLED.value
+
+    @staticmethod
+    def _ensure_acknowledged(order: Order) -> None:
+        """Advance an order to at least PENDING before applying a fill.
+
+        Brokers can report a fill before (or without) an explicit PENDING
+        acknowledgement. The fill transitions are only valid from pending /
+        partially_filled, so with strict transitions an early fill would raise
+        a MachineError. This walks created → sent_to_broker → pending as needed.
+        """
+        if not _TRANSITIONS_AVAILABLE:
+            return
+        if order.state in (OrderStatus.PENDING.value, OrderStatus.PARTIALLY_FILLED.value):
+            return
+        try:
+            if order.state == OrderStatus.CREATED.value:
+                order.submit()
+            if order.state == OrderStatus.SENT_TO_BROKER.value:
+                order.acknowledge()
+        except Exception:
+            # Already past these states, or an unexpected source — let the
+            # subsequent fill trigger surface any genuine invalid transition.
+            pass
 
     async def handle_reject(
         self,

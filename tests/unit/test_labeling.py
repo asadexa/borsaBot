@@ -58,6 +58,30 @@ def test_trending_market_mostly_positive(trending_up_prices):
     assert positive_frac > 0.5
 
 
+def test_short_side_hits_stop_in_uptrend(trending_up_prices):
+    """A short bet (side=-1) in a strong uptrend should mostly hit stop-loss (-1)."""
+    events = make_events(trending_up_prices, n=20, horizon=50)
+    events["side"] = -1.0
+    labels = triple_barrier_labels(trending_up_prices, events)
+    # Shorts in a rising market lose → label -1 (stop hit), not +1.
+    assert (labels == -1).mean() > 0.5
+    assert (labels == 1).mean() < 0.5
+
+
+def test_long_and_short_are_mirror_in_trend(trending_up_prices):
+    """Long and short on the same uptrend events should give opposite labels."""
+    long_events = make_events(trending_up_prices, n=15, horizon=50)
+    short_events = long_events.copy()
+    short_events["side"] = -1.0
+
+    long_labels = triple_barrier_labels(trending_up_prices, long_events)
+    short_labels = triple_barrier_labels(trending_up_prices, short_events)
+
+    # Where the long wins (+1), the short should lose (-1).
+    long_wins = long_labels == 1
+    assert (short_labels[long_wins] == -1).all()
+
+
 def test_daily_vol_is_positive(simple_prices):
     vol = compute_daily_volatility(simple_prices, span=20)
     assert (vol.dropna() > 0).all()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -55,12 +56,14 @@ class EventType(str, Enum):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _seq_counter: int = 0
+_seq_lock = threading.Lock()
 
 
 def _next_seq() -> int:
     global _seq_counter
-    _seq_counter += 1
-    return _seq_counter
+    with _seq_lock:
+        _seq_counter += 1
+        return _seq_counter
 
 
 @dataclass

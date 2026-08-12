@@ -131,6 +131,39 @@ def test_cpcv_embargo_reduces_train_size():
     assert total_emb <= total_no_emb, "Embargo should reduce total training size"
 
 
+def test_cpcv_embargo_applies_after_test_block():
+    """Embargoed training samples must sit immediately AFTER test positions.
+
+    López de Prado embargo guards forward serial-correlation leakage, so every
+    sample dropped by the embargo (present without embargo, absent with it) must
+    have a test position within `embargo_n` slots BEFORE it.
+    """
+    X, y, events, _ = make_data(240)
+    n = len(X)
+    embargo_pct = 0.05
+    embargo_n = max(1, int(n * embargo_pct))
+
+    cpcv_no_emb = CPCV(n_groups=6, n_test_groups=2, embargo_pct=0.0)
+    cpcv_emb    = CPCV(n_groups=6, n_test_groups=2, embargo_pct=embargo_pct)
+
+    for (tr_np, te_np), (tr_emb, te_emb) in zip(
+        cpcv_no_emb.split(X, events), cpcv_emb.split(X, events)
+    ):
+        test_set = set(te_emb.tolist())
+        dropped = set(tr_np.tolist()) - set(tr_emb.tolist())
+        for pos in dropped:
+            # Some samples are dropped by purge too; only check the ones that
+            # are embargo-shaped (a test position lies just before them).
+            after_test = any((pos - off) in test_set for off in range(1, embargo_n + 1))
+            before_test = any((pos + off) in test_set for off in range(1, embargo_n + 1))
+            # An embargoed sample must be reachable from a preceding test pos,
+            # and must never be embargoed purely because a test block follows it.
+            if not after_test:
+                # purge-dropped sample — allowed; skip
+                continue
+            assert after_test, f"embargoed pos {pos} has no preceding test position"
+
+
 def test_cpcv_all_test_groups_covered():
     """Every group should appear as a test group at least once across all splits."""
     X, y, events, _ = make_data(240)

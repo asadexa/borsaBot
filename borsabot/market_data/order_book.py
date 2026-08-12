@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from sortedcontainers import SortedDict
+
+log = logging.getLogger(__name__)
 
 
 class OrderBook:
@@ -22,6 +26,7 @@ class OrderBook:
         self.asks: SortedDict = SortedDict()
         self.last_update_id: int = 0
         self.received_at_ns: int = 0
+        self.gaps: int = 0      # count of detected update-id discontinuities
 
     # ── Update methods ────────────────────────────────────────────────────
 
@@ -52,6 +57,17 @@ class OrderBook:
         # Discard stale deltas
         if u <= self.last_update_id:
             return False
+
+        # Continuity check (Binance: U should be last_update_id + 1). A gap means
+        # one or more updates were dropped and the book is now desynced — flag it
+        # so the feed layer can trigger a REST resnapshot instead of silently
+        # drifting. We still apply the delta as best effort.
+        if self.last_update_id and U > self.last_update_id + 1:
+            self.gaps += 1
+            log.warning(
+                "Order book gap for %s: expected U=%d, got U=%d (resnapshot needed)",
+                self.symbol, self.last_update_id + 1, U,
+            )
 
         for price, qty in delta.get("b", []):
             p, q = float(price), float(qty)

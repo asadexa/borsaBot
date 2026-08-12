@@ -73,8 +73,12 @@ class MockBrokerGateway(BrokerGateway):
     """In-memory mock adapter used in unit tests — no network required."""
 
     name = "mock"
-    _connected = False
-    _orders: dict[str, OrderResponse] = {}
+
+    def __init__(self) -> None:
+        # Instance-level state — class-level mutable defaults would leak orders
+        # and connection state across instances (and across tests).
+        self._connected = False
+        self._orders: dict[str, OrderResponse] = {}
 
     async def connect(self) -> None:
         self._connected = True

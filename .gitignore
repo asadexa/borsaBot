@@ -60,3 +60,4 @@ launcher/hooks/
 
 # UPX (isteğe bağlı sıkıştırma aracı)
 upx*.exe
+.gstack/
